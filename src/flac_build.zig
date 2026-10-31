@@ -1,12 +1,12 @@
 //! Test/bench-only FLAC encoder for small synthetic streams.
 //!
-//! The official corpus has a single file that the decoder handles end to end
-//! (`17 - all fixed orders.flac`), which is not enough to pin down bit depths,
-//! wasted bits, block-size extensions or every channel assignment, so the
-//! exactness tests build their input here instead: STREAMINFO + frames with
-//! CONSTANT/VERBATIM/FIXED subframes and real Rice coding, including the escape
-//! code, wasted bits, both block-size extension bytes and the three
-//! decorrelated channel assignments.
+//! The official corpus covers real encoder output but not every corner (and it
+//! is not committed), so the exactness tests build their input here instead:
+//! STREAMINFO + frames with CONSTANT/VERBATIM/FIXED/LPC subframes and real Rice
+//! coding, including the escape code, wasted bits, both block-size extension
+//! bytes, the three decorrelated channel assignments, LPC orders 1..32,
+//! coefficient precision 1..15, positive and negative prediction shifts, and a
+//! predictor that deliberately exceeds 32 bits.
 //!
 //! Not imported by the library; only tests, fuzz and bench use it.
 
@@ -19,8 +19,9 @@ pub const Frame = struct {
     block_size: u16,
     /// One mode per channel; `samples.len` must match.
     modes: []const Mode,
-    /// Planar source samples: `samples[channel][sample]`.
-    samples: []const []const i32,
+    /// Planar source samples: `samples[channel][sample]`. Defaulted so helpers
+    /// that fill it in afterwards can start from the other fields.
+    samples: []const []const i32 = &.{},
     fixed_order: u8 = 1,
     partition_order: u4 = 0,
     rice_param: u4 = 0,
@@ -35,6 +36,18 @@ pub const Frame = struct {
     /// `subframeBits` for where the side channel sits and how wide it is).
     channel_assignment: ?u4 = null,
     corrupt_header_crc: bool = false,
+    /// LPC parameters, used when the mode is `.lpc`. The decoder derives the
+    /// residual from these exact values, so a test can pin down precision,
+    /// negative shift and predictor arithmetic.
+    lpc_order: u8 = 1,
+    lpc_precision: u6 = 12,
+    lpc_shift: i5 = 0,
+    /// At least `lpc_order` coefficients; the first multiplies the sample
+    /// directly before the predicted one.
+    lpc_coeffs: []const i32 = &[_]i32{1},
+    /// Override the stored "precision - 1" field, so the forbidden 0b1111 can
+    /// be written and the decoder's rejection tested.
+    lpc_raw_precision: ?u4 = null,
 };
 
 pub const File = struct {
@@ -218,14 +231,27 @@ fn writeSubframe(
             for (samples[0..order]) |sample| {
                 try body.writeSigned(sample >> frame.wasted, reduced_bits);
             }
-            try writeResidual(body, frame, samples, order);
+            try writeResidual(body, frame, mode, samples, order);
         },
         .lpc => {
-            // The decoder must reject this before reading anything else; the
-            // subframe header alone is enough to be unambiguous.
+            const order = frame.lpc_order;
+            std.debug.assert(order >= 1 and order <= 32);
+            std.debug.assert(frame.lpc_coeffs.len >= order);
+            std.debug.assert(frame.lpc_precision >= 1 and frame.lpc_precision <= 15);
             try body.writeBits(0, 1);
-            try body.writeBits(0x20, 6); // LPC, order 1
+            try body.writeBits(0x20 | (order - 1), 6); // 1xxxxx, order - 1
             try writeWasted(body, frame.wasted);
+            for (samples[0..order]) |sample| {
+                try body.writeSigned(sample >> frame.wasted, reduced_bits);
+            }
+            const raw_precision: u4 = frame.lpc_raw_precision orelse
+                @intCast(frame.lpc_precision - 1);
+            try body.writeBits(raw_precision, 4);
+            try body.writeBits(@as(u5, @bitCast(frame.lpc_shift)), 5);
+            for (frame.lpc_coeffs[0..order]) |coeff| {
+                try body.writeSigned(coeff, frame.lpc_precision);
+            }
+            try writeResidual(body, frame, mode, samples, order);
         },
     }
 }
@@ -244,6 +270,7 @@ fn writeWasted(body: *BitWriter, wasted: u5) !void {
 fn writeResidual(
     body: *BitWriter,
     frame: Frame,
+    mode: Mode,
     samples: []const i32,
     order: u8,
 ) !void {
@@ -267,8 +294,14 @@ fn writeResidual(
             const position = index + i;
             // Prediction happens in the reduced domain: that is how a real
             // encoder and the decoder both treat wasted bits.
-            const predicted = predictor(frame.fixed_order, samples, position, frame.wasted);
-            const residual = @as(i64, samples[position] >> frame.wasted) - predicted;
+            const predicted: i128 = switch (mode) {
+                .fixed => predictor(frame.fixed_order, samples, position, frame.wasted),
+                .lpc => lpcPredict(frame, samples, position),
+                else => unreachable,
+            };
+            const residual: i64 = @intCast(
+                @as(i128, samples[position] >> frame.wasted) - predicted,
+            );
             if (frame.escape_raw_bits != 0) {
                 try body.writeSigned(@intCast(residual), frame.escape_raw_bits);
             } else {
@@ -307,6 +340,20 @@ fn predictor(order: u8, samples: []const i32, i: usize, wasted: u5) i64 {
             4 * (samples[i - 3] >> wasted) - (samples[i - 4] >> wasted),
         else => unreachable,
     };
+}
+
+/// The same predictor the decoder must compute, but in i128 so the overflow
+/// test can build a stream whose sum does not fit 32 bits.
+fn lpcPredict(frame: Frame, samples: []const i32, i: usize) i128 {
+    var sum: i128 = 0;
+    for (0..frame.lpc_order) |j| {
+        sum += @as(i128, frame.lpc_coeffs[j]) *
+            @as(i128, samples[i - 1 - j] >> frame.wasted);
+    }
+    return if (frame.lpc_shift >= 0)
+        sum >> @intCast(frame.lpc_shift)
+    else
+        sum << @intCast(-@as(i32, frame.lpc_shift));
 }
 
 /// MSB-first bit writer. Slow on purpose: it only ever encodes test fixtures.

@@ -25,8 +25,8 @@ pub const Info = struct {
 pub const Error = error{
     /// Not a recognized audio signature (including an empty stream).
     NotAudio,
-    /// Recognized, but not supported. For FLAC: LPC subframes, and side
-    /// channels of a 32-bit stream (they would be 33 bits wide).
+    /// Recognized, but not supported. For FLAC: side channels of a 32-bit
+    /// stream (they would be 33 bits wide).
     Unsupported,
     /// The stream ended before a complete header or frame.
     Truncated,

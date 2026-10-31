@@ -1,14 +1,14 @@
 //! Test helper: compare this decoder's i16 output against ffmpeg's raw PCM,
 //! sample by sample.
 //!
-//! Three modes:
+//! Two comparison modes:
 //!   * `expectExact` — full file, ffmpeg `-f s16le` (integer sources <= 16 bit,
 //!     and WAV's own conversion rules);
 //!   * `expectExactS32` — full file, ffmpeg `-f s32le`, reference shifted right
-//!     by 16. This is the rule for FLAC sources wider than 16 bits;
-//!   * `expectPrefixExact` — the longest decodable prefix of a stream that
-//!     later returns `Unsupported` (the official vectors), compared against the
-//!     first N samples of ffmpeg's full decode.
+//!     by 16. This is the rule for FLAC sources wider than 16 bits.
+//!
+//! `decodePrefix` returns the samples delivered before a frame error, which the
+//! truncation and corrupt-stream tests use.
 //!
 //! For float WAV input a tolerance of 1 LSB may be used, because the source is
 //! not integer PCM and ffmpeg's float->s16 rounding is not part of the format.
@@ -211,40 +211,4 @@ pub fn expectExactS32(allocator: std.mem.Allocator, bytes: []const u8) !void {
 /// Require agreement within `tolerance` LSBs (use 0 for integer PCM).
 pub fn expectWithin(allocator: std.mem.Allocator, bytes: []const u8, tolerance: u16) !void {
     try report(try compareWithFfmpeg(allocator, bytes), tolerance);
-}
-
-/// Compare the longest decodable prefix of `bytes` (a stream that later
-/// returns `Unsupported`) against the first N samples of ffmpeg's full decode.
-/// Returns the prefix length in samples.
-pub fn expectPrefixExact(allocator: std.mem.Allocator, bytes: []const u8) !usize {
-    const prefix = try decodePrefix(allocator, bytes);
-    defer allocator.free(prefix.samples);
-
-    const raw = try runFfmpeg(allocator, bytes, "s16le");
-    defer allocator.free(raw);
-    if (raw.len % 2 != 0) return error.OddReferenceLength;
-    const reference_samples = raw.len / 2;
-    if (reference_samples < prefix.samples.len) {
-        std.debug.print(
-            "prefix longer than reference: prefix {d}, ffmpeg {d}\n",
-            .{ prefix.samples.len, reference_samples },
-        );
-        return error.SampleCountMismatch;
-    }
-
-    var max_diff: u16 = 0;
-    for (prefix.samples, 0..) |ours, i| {
-        const theirs = std.mem.readInt(i16, raw[i * 2 ..][0..2], .little);
-        const delta: i32 = @as(i32, ours) - @as(i32, theirs);
-        const abs_diff: u16 = @intCast(if (delta < 0) -delta else delta);
-        if (abs_diff != 0) {
-            std.debug.print(
-                "prefix mismatch at {d}: ours {d}, ffmpeg {d}\n",
-                .{ i, ours, theirs },
-            );
-            return error.PcmMismatch;
-        }
-        if (abs_diff > max_diff) max_diff = abs_diff;
-    }
-    return prefix.samples.len;
 }

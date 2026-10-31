@@ -28,7 +28,8 @@ pub const Decoder = struct {
     done: bool = false,
     /// A frame-level error discovered after some samples were already handed
     /// to the caller. `read` returns those samples first, then this error, so a
-    /// vector that turns LPC halfway through still yields its valid prefix.
+    /// stream that goes corrupt or truncated halfway still yields its valid
+    /// prefix.
     pending_error: ?types.Error = null,
 
     /// Decode up to `out.len / channels` frames. See `root.Decoder.read`.

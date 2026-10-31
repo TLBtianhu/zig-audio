@@ -328,26 +328,6 @@ test "frame header: block-size extension bytes and explicit sample rate" {
     try testing.expectEqual(@as(usize, 400), decoded.len);
 }
 
-test "LPC subframes are Unsupported, not mis-decoded" {
-    const samples = [_]i32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const planes = [_][]const i32{&samples};
-    const frames = [_]build.Frame{.{ .block_size = 8, .modes = &.{.lpc}, .samples = &planes }};
-    const bytes = try build.build(testing.allocator, .{
-        .sample_rate = 44_100,
-        .channels = 1,
-        .bits_per_sample = 16,
-        .total_samples = 8,
-        .frames = &frames,
-    });
-    defer testing.allocator.free(bytes);
-
-    var reader = std.Io.Reader.fixed(bytes);
-    var dec = try openDecoder(&reader);
-    defer dec.deinit();
-    var out: [64]i16 = undefined;
-    try testing.expectError(error.Unsupported, dec.read(&out));
-}
-
 test "truncation: metadata, frame header and frame body are Truncated" {
     const samples: [64]i32 = @splat(0);
     const planes = [_][]const i32{&samples};

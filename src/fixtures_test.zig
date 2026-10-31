@@ -82,9 +82,9 @@ const FlacCase = struct {
     wav_source: ?[]const u8 = null,
 };
 
-// Regenerated for the FLAC Stage A round: ffmpeg was told to use fixed
-// predictors and independent channels so these files stay inside the
-// supported subset. The LPC file is the negative case.
+// Two groups: fixed-predictor files (independent channels) and LPC files. The
+// LPC stereo file is transcoded from the same WAV as the fixed one, so the
+// offline comparison covers the LPC path without any external tool.
 const flac_cases = [_]FlacCase{
     .{
         .name = "flac s16 stereo",
@@ -121,6 +121,15 @@ const flac_cases = [_]FlacCase{
         .bits = 16,
         .frames = 160,
     },
+    .{
+        .name = "flac s16 stereo 44k (LPC order 32, mid/side)",
+        .bytes = @embedFile("fixtures/flac-s16-stereo-44100-lpc.flac"),
+        .channels = 2,
+        .sample_rate = 44_100,
+        .bits = 16,
+        .frames = 882,
+        .wav_source = wav_cases[0].bytes,
+    },
 };
 
 test "committed ffmpeg WAV fixtures decode fully" {
@@ -152,8 +161,8 @@ test "committed ffmpeg WAV fixtures decode fully" {
     }
 }
 
-test "committed fixed-predictor FLAC fixtures decode fully" {
-    for (flac_cases[0..3]) |case| {
+test "committed FLAC fixtures decode fully" {
+    for (flac_cases) |case| {
         try testing.expectEqual(root.Format.flac, root.probe(case.bytes[0..12]).?);
 
         var reader = std.Io.Reader.fixed(case.bytes);
@@ -183,9 +192,11 @@ test "committed fixed-predictor FLAC fixtures decode fully" {
 
 test "committed FLAC fixtures decode to the same PCM as their WAV sources" {
     // Fully offline: the FLAC encoder is lossless, so both decoders must agree
-    // byte for byte on 16-bit, 24-bit and 6-channel material.
-    for (flac_cases[0..3]) |case| {
-        const source = case.wav_source.?;
+    // byte for byte on 16-bit, 24-bit and 6-channel material — including the
+    // LPC order-32 mid/side fixture, which exercises prediction, the 17-bit
+    // side plane and decorrelation in one file.
+    for (flac_cases) |case| {
+        const source = case.wav_source orelse continue;
         const from_flac = try testutil.decodeAll(testing.allocator, case.bytes, 512);
         defer testing.allocator.free(from_flac);
         const from_wav = try testutil.decodeAll(testing.allocator, source, 512);
@@ -205,15 +216,12 @@ test "committed 24-bit FLAC matches ffmpeg -f s32le shifted right by 16" {
     try testing.expectEqual(@as(u16, 0), result.max_diff);
 }
 
-test "committed LPC FLAC fixture is Unsupported, not mis-decoded" {
-    const case = flac_cases[3];
-    var reader = std.Io.Reader.fixed(case.bytes);
-    var dec = try root.open(testing.allocator, &reader);
-    defer dec.deinit();
-    try testing.expectEqual(@as(u32, 8_000), dec.info.sample_rate);
-
-    var out: [64]i16 = undefined;
-    try testing.expectError(error.Unsupported, dec.read(&out));
+test "committed LPC FLAC fixtures match ffmpeg sample for sample" {
+    // Skipped when ffmpeg is absent (non-Windows CI); the offline decode above
+    // and the WAV-source comparison still cover both LPC files there.
+    for ([_]usize{ 3, 4 }) |i| {
+        try compare.expectExact(testing.allocator, flac_cases[i].bytes);
+    }
 }
 
 test "committed FLAC fixture: 50% cut and mid-frame cut are Truncated" {

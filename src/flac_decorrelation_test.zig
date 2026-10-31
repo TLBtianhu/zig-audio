@@ -8,7 +8,6 @@
 //! is wrong, or if mid/side drops the side channel's low bit.
 
 const std = @import("std");
-const root = @import("root.zig");
 const testutil = @import("testutil.zig");
 const build = @import("flac_build.zig");
 const testing = std.testing;
@@ -192,13 +191,13 @@ test "decorrelation happens after wasted bits are restored" {
     }
 }
 
-test "LPC inside a decorrelated frame is still Unsupported" {
-    const values = [_]i32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+test "LPC inside a decorrelated frame composes with all three assignments" {
+    const values = [_]i32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
 
     var assignment: u4 = 8;
     while (assignment <= 10) : (assignment += 1) {
-        // Put the LPC subframe after a decodable one where the layout allows
-        // it, so the error comes from the subframe type, not the channel setup.
+        // The LPC subframe sits where each assignment puts the side channel, so
+        // the one-bit-wider plane is the one doing prediction.
         const modes: []const build.Mode = if (assignment == 9)
             &.{ .lpc, .verbatim }
         else
@@ -213,10 +212,8 @@ test "LPC inside a decorrelated frame is still Unsupported" {
         );
         defer testing.allocator.free(bytes);
 
-        var reader = std.Io.Reader.fixed(bytes);
-        var dec = try root.open(testing.allocator, &reader);
-        defer dec.deinit();
-        var out: [32]i16 = undefined;
-        try testing.expectError(error.Unsupported, dec.read(&out));
+        const decoded = try decode(testing.allocator, bytes);
+        defer testing.allocator.free(decoded);
+        try expectStereo(&values, &values, decoded);
     }
 }

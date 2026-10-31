@@ -1,14 +1,17 @@
 //! FLAC frame decoding: header, CrC-8, subframes, Rice residual, CRC-16.
 //!
 //! Supported subset:
-//!   * subframes: CONSTANT, VERBATIM, FIXED orders 0..4, all Rice partitions
-//!     (including the escape code), wasted bits;
+//!   * subframes: CONSTANT, VERBATIM, FIXED orders 0..4 and LPC orders 1..32,
+//!     all Rice partitions (including the escape code), wasted bits;
 //!   * channel assignment: independent (0..7), left/side (8), right/side (9)
 //!     and mid/side (10).
 //!
-//! LPC subframes are recognized and answered with `error.Unsupported`, never
-//! mis-decoded: a decoder that emits wrong PCM is worse than one that says
-//! "not yet".
+//! LPC arithmetic follows RFC 9639 Appendix A.3/A.4: the predictor is summed
+//! in a signed type wide enough for `(sample bits + coefficient precision +
+//! ceil(log2(order)))`, which is i64 here, and the prediction is *not*
+//! truncated to the subframe bit depth before the residual is added. Truncating
+//! the high bits would decode `61 - predictor overflow check` to plausible but
+//! wrong audio.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -289,9 +292,11 @@ fn decodeSubframe(
             if (order > 4) return error.Corrupt;
             try decodeFixed(bits, block_size, effective, order, out);
         },
-        // LPC: deliberately not implemented yet. Answering Unsupported
-        // before consuming the subframe is what keeps the error honest.
-        32...63 => return error.Unsupported,
+        // 1xxxxx: LPC, order = low five bits + 1.
+        32...63 => {
+            const order: u8 = @intCast((sub_type & 0x1F) + 1);
+            try decodeLpc(bits, block_size, effective, order, out);
+        },
         else => return error.Corrupt, // reserved subframe types
     }
 
@@ -343,6 +348,77 @@ fn decodeFixed(
         },
         else => return error.Corrupt,
     }
+}
+
+/// Decode one linear-predictor subframe (RFC 9639 Section 9.2.6).
+///
+/// Bitstream order is: `order` warm-up samples at the subframe's (reduced) bit
+/// depth, the 4-bit predictor-coefficient precision minus one, the 5-bit signed
+/// prediction shift, `order` coefficients at that precision, then the same
+/// Rice-coded residual a FIXED subframe uses.
+fn decodeLpc(
+    bits: *BitReader,
+    block_size: u32,
+    bps: u6,
+    order: u8,
+    out: []i32,
+) Error!void {
+    // An order larger than the block cannot be represented; checking before the
+    // warm-up loop also keeps the writes inside `out`.
+    if (@as(u32, order) > block_size) return error.Corrupt;
+
+    var i: usize = 0;
+    while (i < order) : (i += 1) out[i] = try bits.readSigned(bps);
+
+    // The stored field is (precision - 1); 0b1111 would mean 16 bits and is
+    // forbidden by Table 22. A stored 0 is *valid* and means precision 1.
+    const raw_precision = try bits.readBits(4);
+    if (raw_precision == 0x0F) return error.Corrupt;
+    const precision: u6 = @intCast(raw_precision + 1);
+
+    // Signed two's complement. RFC 9639 forbids encoders from writing a
+    // negative value, but the field is defined as signed and the intended
+    // meaning is a left shift, so decode that instead of failing the stream.
+    const shift: i5 = @bitCast(@as(u5, @intCast(try bits.readBits(5))));
+
+    var coeffs: [32]i32 = undefined;
+    for (coeffs[0..order]) |*coeff| coeff.* = try bits.readSigned(precision);
+
+    try decodeResidual(bits, out[order..], order, block_size);
+
+    // RFC 9639 A.3: with 32 coefficients of 15 bits and 33-bit side samples the
+    // sum needs at most 33 + 15 + 5 = 53 bits, so i64 is ample. The addition of
+    // the residual is checked, and a value that does not fit i32 is rejected
+    // instead of silently wrapping.
+    var n: usize = order;
+    while (n < out.len) : (n += 1) {
+        var sum: i64 = 0;
+        var j: usize = 0;
+        while (j < order) : (j += 1) {
+            sum += @as(i64, coeffs[j]) * @as(i64, out[n - 1 - j]);
+        }
+        // A negative shift is a left shift. Its exact value may exceed i64 even
+        // though every conforming stream keeps the final sample in range; that
+        // is a corrupt stream, not a wrap-around.
+        const prediction: i64 = if (shift >= 0)
+            sum >> @intCast(shift)
+        else
+            try shiftLeft(sum, @intCast(-@as(i32, shift)));
+
+        const added = @addWithOverflow(prediction, @as(i64, out[n]));
+        if (added[1] != 0) return error.Corrupt;
+        out[n] = try fit(added[0]);
+    }
+}
+
+/// `value << amount` with a range check, so a crafted negative shift cannot
+/// trigger Zig's safety-checked left-shift overflow in debug builds or fuzzing.
+fn shiftLeft(value: i64, amount: u6) Error!i64 {
+    const wide = @as(i128, value) << amount;
+    if (wide < std.math.minInt(i64) or wide > std.math.maxInt(i64)) {
+        return error.Corrupt;
+    }
+    return @intCast(wide);
 }
 
 fn decodeResidual(

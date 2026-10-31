@@ -4,9 +4,9 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：**v0.2**。WAV（PCM / IEEE float / EXTENSIBLE）完整支持；FLAC 为**部分支持**：CONSTANT / VERBATIM / FIXED(0–4) + Rice 分区、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。LPC 子帧仍明确返回 `error.Unsupported`，留到下一轮，绝不输出错误音频。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。
 
-## FLAC：部分支持
+## FLAC：完整支持
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
@@ -16,19 +16,19 @@
 | 帧尾 CRC-16 | ✅ | 覆盖整帧（含帧头），不一致 → `error.Corrupt` |
 | CONSTANT / VERBATIM 子帧 | ✅ | |
 | FIXED 0–4 阶 + Rice 分区 | ✅ | 4/5 位参数、partition order、escape code（未压缩分区）、wasted bits |
+| LPC 1–32 阶 | ✅ | qlp 系数精度 1–15 位（存储字段 0–14，`0b1111` 禁止）；5 位有符号 shift（负值按左移解码）；预测在 i64 中累加，不按 bps 截断 |
 | independent 声道（1–8） | ✅ | 声道顺序原样保留，不混音 |
 | left/side、right/side、mid/side | ✅ | side 子帧比源位深多 1 位（right/side 的 side 在**第一个**子帧）；mid/side 用 side 的最低位恢复 `mid` 丢掉的奇偶位；去相关在 wasted bits 展开之后做 |
-| LPC 子帧（任何阶数） | ❌ | `error.Unsupported`（下一步） |
 
-**为什么先切这个子集**：位流骨架（位读取、帧头/帧尾 CRC、Rice 分区、块大小扩展）已足以让真实文件逐比特验证；去相关只是"两路合成一路"，失败时很容易定位。LPC 需要 qlp precision、正负 shift、33 位中间结果，单独一轮做，失败时才不会和位流解析混在一起。
-
-**下一步**：LPC 合成（qlp precision、正负 shift、33 位中间结果）。
+**LPC 预测语义**（RFC 9639 §9.2.6、附录 A.3/A.4）：`prediction = (Σ coeff[i] × sample[n-1-i]) >> shift`，其中 `Σ` 在 i64 中累加（最坏情况约 33 + 15 + 5 = 53 位），**预测值不按子帧位深截断**——它可能远大于 16 位样本范围，要等加上残差后才落回样本范围；提前截断高位会得到"听起来正常但样本错误"的输出。`shift` 为负时按历史语义左移；规范要求编码器不得写负值，解码端接受它并做了溢出检查。最终样本 + 残差用带溢出检查的加法写入 i32，任何越界都返回 `error.Corrupt`，绝不回绕。
 
 **内存**：`open()` 按 STREAMINFO 的 max block size 分配一帧的 i32 缓冲（常见 4096×2×4 = 32 KiB，上限 65535×8×4 = 2 MiB），`read()` 之后不再分配；`deinit()` 释放。
 
-**官方测试向量的现实**：13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 文件里，`17 - all fixed orders.flac` 已能**整文件解码**（204 帧 / 234514 样本，L/S + R/S + M/S，无 LPC），并与 ffmpeg 逐样本 `max_diff 0`。其余文件仍会在某个 LPC 子帧返回 `Unsupported`；`03 - blocksize 16.flac` 的解码前缀因此从 2 帧增长到 817 帧（26144 样本）。测试分两层：
-1. 元数据必须完全正确，解出的前缀必须与 ffmpeg **逐样本一致**（如 `60 - mono audio.flac` 的前 81920 个样本），之后必须返回 `Unsupported`，绝不静默截断；`17` 则要求整文件逐样本一致；
-2. 位深转换、FIXED 0–4 阶、Rice 分区、escape code、wasted bits 与三种去相关声道由 `src/flac_build.zig` 构造的合成流覆盖，并与 ffmpeg 的解码结果对齐。
+**官方测试向量**：13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 文件**全部整文件解码**，并与 ffmpeg 逐样本 `max_diff 0`。这批文件覆盖 LPC 阶数（subset 范围内）与 qlp 精度 2/15、wasted 1–12、8/12/16 位、1/3/6 声道、三种去相关、总样本数未知（`total_frames = null`）与 escape-code 分区。测试分两层：
+1. 官方向量：元数据必须完全正确，整文件样本数等于声明值（`45` 例外，按实际解码数），并与 ffmpeg 逐样本一致；`60` 的 50% 截断必须返回 `error.Truncated`；
+2. 位深转换、FIXED 0–4 阶、LPC 1–32 阶、qlp precision 1/2/15、负 shift、32 位以上预测和、Rice 分区、escape code、wasted bits 与三种去相关声道由 `src/flac_build.zig` 构造的合成流覆盖（`src/flac_lpc_test.zig`），并与 ffmpeg 的解码结果对齐。
+
+`61 - predictor overflow check` 的预测值达到 860128（远超 16 位样本范围），而累加和最大约 8.8×10⁸；它检验的是"预测值不能按 bps 截断"，不是 32 位累加和溢出。真正超过 32 位的累加和由合成用例覆盖：`Σ = 32 × 16383 × 32767 = 17178296352`（约为 2³⁴、i32 上限的 8 倍），i32 回绕会预测出 −48 而不是 524240。
 
 ## 这不是 Zig 版 FFmpeg
 
@@ -53,7 +53,7 @@
 
 音频不一样：Windows 上 WASAPI 只负责**输出**，系统并不带 FLAC / Opus 解码器；macOS 的 AudioToolbox 对 FLAC 的支持也随版本和容器而变。一个应用如果想“走到哪都能放 FLAC”，最后往往还是得自带解码器。音频格式的专利面也窄得多（FLAC、Opus 都是开放、免专利的），维护成本比视频低一个数量级。
 
-所以这里只做音频：**WAV 已完整，FLAC 部分支持（待补 LPC），Opus 等 FLAC 稳定后再评估。**
+所以这里只做音频：**WAV 已完整，FLAC 子帧集合已完整**（官方 13 个向量全部整文件逐样本对齐），Opus 等后续再评估。
 
 ## 用法
 
@@ -95,7 +95,7 @@ if (audio.probe(header)) |format| {
 
 `probe()` 是纯函数；`open()` 会消费流。两者都不“猜”格式：认不出来就是 `error.NotAudio`。
 
-## 支持的格式（v0.2）
+## 支持的格式
 
 ### WAV：完整支持
 
@@ -135,7 +135,6 @@ if (audio.probe(header)) |format| {
 
 | 变体 | 错误 | 原因 |
 | --- | --- | --- |
-| LPC 子帧（阶数 1–32） | `error.Unsupported` | 下一步；在读完子帧头后立即返回，不猜样本 |
 | 32 位 FLAC 的 side 声道 | `error.Unsupported` | side 需要 33 位，超出 i32 帧缓冲与 32 位位读取器；明确拒绝而不是截断最高位 |
 | 保留的声道分配 11–15、保留的子帧类型、保留的位深/块大小/采样率编码 | `error.Corrupt` | 格式本身不允许 |
 | 帧头 CRC-8 或帧尾 CRC-16 不匹配 | `error.Corrupt` | 坏帧不会被当成好音频 |
@@ -147,7 +146,7 @@ if (audio.probe(header)) |format| {
 | 输入开头 | `probe()` | `open()` |
 | --- | --- | --- |
 | `RIFF` … `WAVE` | `.wav` | 尝试按 WAV 打开 |
-| `fLaC` | `.flac` | 尝试按 FLAC 打开（支持 CONSTANT / VERBATIM / FIXED + 三种去相关） |
+| `fLaC` | `.flac` | 尝试按 FLAC 打开（支持 CONSTANT / VERBATIM / FIXED / LPC + 三种去相关） |
 | `RF64` / `RIFX` + `WAVE` | `null` | `error.Unsupported` |
 | 其他 | `null` | `error.NotAudio` |
 
@@ -168,7 +167,7 @@ pub const Info = struct {
 
 pub const Error = error{
     NotAudio,    // 不是本库认识的音频签名
-    Unsupported, // 认识但不支持（FLAC 的 LPC、32 位 side 声道、压缩 WAV、RIFX/RF64…）
+    Unsupported, // 认识但不支持（FLAC 32 位 side 声道、压缩 WAV、RIFX/RF64…）
     Truncated,   // 流在完整头部/帧之前结束
     Corrupt,     // 头部字段自相矛盾、CRC 不符或结构损坏
     OutOfMemory, // open 时分配失败（WAV 不分配；FLAC 分配一帧缓冲）
@@ -192,7 +191,7 @@ pub const Decoder = struct {
 - **调用方给缓冲**：`read()` 只在 `out` 里写，不分配；`open()` 是唯一可能使用 allocator 的地方（WAV 不分配，FLAC 按 STREAMINFO 的 max block size 分配一帧 i32 缓冲）。
 - **`read()` 的容量**：能解 `out.len / info.channels` 帧。`out.len` 不是声道数的整数倍时，只解完整帧，尾部 i16 不碰；`out.len == 0` 返回 0；`0 < out.len < channels` 返回 `error.ShortBuffer`。
 - **返回的是写入的 i16 个数**，一定是 `channels` 的整数倍；`0` 表示流结束。
-- **FLAC 的前缀语义**：如果某一帧失败（LPC、CRC、截断），此前已经解出的样本会先返回；下一次 `read()` 返回同一个错误。调用方既能拿到合法音频，也能看到具名失败，而不是被“半段静音”糊弄。
+- **FLAC 的前缀语义**：如果某一帧失败（CRC、截断、32 位 side），此前已经解出的样本会先返回；下一次 `read()` 返回同一个错误。调用方既能拿到合法音频，也能看到具名失败，而不是被“半段静音”糊弄。
 - **声道原样保留**：不做下混、不做上混、不做采样率转换。5.1 就是 6 声道。
 - **reader 生命周期**：`reader` 由调用方持有，必须比 `Decoder` 活得久；`deinit()` 不关闭 reader。
 - **错误后不复用**：`read()` 返回任何错误后，这个 decoder 的状态不再保证，直接 `deinit()`；不要用“再读一次”来探测错误是否消失。
@@ -250,16 +249,16 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 zig build            # 编译库（static lib 到 zig-out/）
 zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz
 zig build fuzz       # 10000 轮变异 fuzz（WAV 与 FLAC 各一半）
-zig build bench      # 10 秒 WAV + 20 秒 FLAC 解码基准（ReleaseFast；低于各自目标会失败）
+zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）解码基准（ReleaseFast；低于目标会失败）
 ```
 
 集成测试会尝试调用本机 ffmpeg（Windows 路径写死为开发机上的位置）；路径不存在或不是 Windows 时测试自动 `SkipZigTest`，CI 不依赖 ffmpeg。
 
-除了实时 ffmpeg 测试，仓库还提交了 **0.02 秒的 ffmpeg 生成样本**（`src/fixtures/`，总计约 78 KB）：没有 ffmpeg 的 CI 也能解码真实的 PCM8/16/24/32、float32、5.1 WAV，以及固定预测 + independent 声道的 FLAC（另有 1 个 LPC 文件专门验证 `Unsupported`）。
+除了实时 ffmpeg 测试，仓库还提交了 **0.02 秒的 ffmpeg 生成样本**（`src/fixtures/`，总计约 90 KB）：没有 ffmpeg 的 CI 也能解码真实的 PCM8/16/24/32、float32、5.1 WAV，以及固定预测和 LPC（mono 8 kHz、stereo 44.1 kHz order 32 mid/side）的 FLAC；其中的 stereo LPC 文件还与其同源 WAV 逐样本一致。
 
 - `tools/fetch-vectors.ps1`：把 13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 官方向量下载到 `.zig-cache/vectors/`，逐个做 SHA-256 校验；向量不进 git。向量缺失时 FLAC 测试打印一行说明并 `SkipZigTest`，不会失败。
-- `src/compare.zig`：测试辅助。把本库解出的 i16 与 ffmpeg 的 `-f s16le`、`-f s32le >> 16` 逐样本比较，并支持“最长可解前缀”的对比（官方向量专用）。
-- `src/flac_build.zig`：测试专用的小型 FLAC 编码器，用来造 CONSTANT / VERBATIM / FIXED、各种位深、块大小扩展、wasted bits、escape code，以及 L/S、R/S、M/S 三种去相关声道的精确用例；不参与库代码。
+- `src/compare.zig`：测试辅助。把本库解出的 i16 与 ffmpeg 的 `-f s16le`、`-f s32le >> 16` 逐样本比较，并支持“截断流的可解前缀”对比（60 号向量的 50% 截断用例）。
+- `src/flac_build.zig`：测试专用的小型 FLAC 编码器，用来造 CONSTANT / VERBATIM / FIXED / LPC、各种位深、块大小扩展、wasted bits、escape code、LPC 精度/阶数/正负 shift，以及 L/S、R/S、M/S 三种去相关声道的精确用例；不参与库代码。
 
 ### 目录
 

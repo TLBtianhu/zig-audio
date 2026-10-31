@@ -1,6 +1,6 @@
 //! Decode benchmarks: 10 s of 16-bit stereo 44.1 kHz WAV built in memory, and
-//! 20 s worth of a committed fixed-predictor FLAC fixture decoded through the
-//! public streaming API.
+//! 20 s worth of committed ffmpeg FLAC fixtures — one fixed-predictor file and
+//! one LPC order-32 mid/side file — decoded through the public streaming API.
 //!
 //! The benchmark always compiles as ReleaseFast (see build.zig). Each section
 //! fails if throughput drops below its target, so a regression is visible
@@ -16,8 +16,12 @@ const seconds: u32 = 10;
 const wav_target_speedup: f64 = 200.0;
 
 /// 0.02 s, 882 frames of a 440 Hz sine, encoded by ffmpeg with fixed
-/// predictors and independent channels (the LPC-free subset).
+/// predictors and independent channels (the LPC-free path).
 const flac_fixture = @embedFile("fixtures/flac-s16-stereo-44100.flac");
+/// The same source, encoded with ffmpeg `-lpc_type levinson
+/// -min/max_prediction_order 32 -ch_mode mid_side`: prediction runs on a
+/// 16-bit plane and, for the mid/side side channel, on a 17-bit plane.
+const flac_lpc_fixture = @embedFile("fixtures/flac-s16-stereo-44100-lpc.flac");
 const flac_seconds: f64 = 20.0;
 const flac_target_speedup: f64 = 100.0;
 
@@ -25,7 +29,8 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     try benchWav(allocator, io);
-    try benchFlac(allocator, io);
+    try benchFlac(allocator, io, "FLAC fixed", flac_fixture);
+    try benchFlac(allocator, io, "FLAC LPC", flac_lpc_fixture);
 }
 
 fn benchWav(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -72,7 +77,12 @@ fn benchWav(allocator: std.mem.Allocator, io: std.Io) !void {
     );
 }
 
-fn benchFlac(allocator: std.mem.Allocator, io: std.Io) !void {
+fn benchFlac(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    label: []const u8,
+    fixture: []const u8,
+) !void {
     var pcm: [8192]i16 = undefined;
     var decoded_frames: u64 = 0;
     var files: usize = 0;
@@ -82,7 +92,7 @@ fn benchFlac(allocator: std.mem.Allocator, io: std.Io) !void {
     // which is what a player doing gapless track changes actually pays.
     const started = std.Io.Clock.Timestamp.now(io, .awake);
     while (@as(f64, @floatFromInt(decoded_frames)) / sample_rate < flac_seconds) : (files += 1) {
-        var reader = std.Io.Reader.fixed(flac_fixture);
+        var reader = std.Io.Reader.fixed(fixture);
         var dec = try root.open(allocator, &reader);
         defer dec.deinit();
 
@@ -102,7 +112,7 @@ fn benchFlac(allocator: std.mem.Allocator, io: std.Io) !void {
     if (elapsed_ns <= 0) return error.TimerResolutionTooLow;
 
     try report(
-        "FLAC fixed",
+        label,
         elapsed_ns,
         @floatFromInt(decoded_frames),
         sample_rate,

@@ -98,23 +98,30 @@ pub fn run(allocator: std.mem.Allocator, rounds: usize, seed: u64) !Stats {
     return stats;
 }
 
-/// A valid FLAC template with all three Stage A subframe types and a
-/// multi-partition Rice residual, so mutations reach the frame decoder rather
-/// than only the metadata parser.
+/// A valid FLAC template with all four subframe types and a multi-partition
+/// Rice residual, so mutations reach the frame decoder rather than only the
+/// metadata parser. The LPC frame makes qlp precision/shift/coefficient bytes
+/// part of the mutation surface too.
 fn buildFlacTemplate(allocator: std.mem.Allocator) ![]u8 {
     const flat: [32]i32 = @splat(1234);
     var verbatim: [32]i32 = undefined;
     var fixed: [32]i32 = undefined;
+    var lpc: [32]i32 = undefined;
     for (&verbatim, 0..) |*slot, i| {
         slot.* = @as(i32, @intCast(i % 11)) * 40 - 200;
     }
     for (&fixed, 0..) |*slot, i| {
         slot.* = @as(i32, @intCast(i)) * 17 - 300;
     }
+    for (&lpc, 0..) |*slot, i| {
+        slot.* = @as(i32, @intCast((i * 211) % 4001)) - 2000;
+    }
 
     const planes_constant = [_][]const i32{&flat};
     const planes_verbatim = [_][]const i32{&verbatim};
     const planes_fixed = [_][]const i32{&fixed};
+    const planes_lpc = [_][]const i32{&lpc};
+    const lpc_coeffs = [_]i32{ 3, -2, 1, 0 };
     const frames = [_]flac_build.Frame{
         .{ .block_size = 32, .modes = &.{.constant}, .samples = &planes_constant },
         .{ .block_size = 32, .modes = &.{.verbatim}, .samples = &planes_verbatim },
@@ -126,12 +133,22 @@ fn buildFlacTemplate(allocator: std.mem.Allocator) ![]u8 {
             .partition_order = 1,
             .rice_param = 1,
         },
+        .{
+            .block_size = 32,
+            .modes = &.{.lpc},
+            .samples = &planes_lpc,
+            .lpc_order = 4,
+            .lpc_coeffs = &lpc_coeffs,
+            .lpc_shift = 4,
+            .lpc_precision = 12,
+            .rice_param = 3,
+        },
     };
     return flac_build.build(allocator, .{
         .sample_rate = 44_100,
         .channels = 1,
         .bits_per_sample = 16,
-        .total_samples = 96,
+        .total_samples = 128,
         .frames = &frames,
     });
 }
