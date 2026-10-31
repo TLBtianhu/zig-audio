@@ -2,9 +2,10 @@
 //! (G.711 / ADPCM) and Ogg/Vorbis/Opus templates, flip/truncate bytes, and
 //! drive the public parser/decoder through every reachable error path.
 //!
-//! Opus is a special case: `open` refuses it before parsing, so every
-//! Ogg-looking input is *also* handed to `opus.inspect` directly. That is what
-//! keeps the OpusHead/OpusTags/TOC parser inside the fuzz surface.
+//! Ogg/Opus gets two passes. The dispatcher decodes it now, so the CELT decoder
+//! sees every mutated payload; and every Ogg-looking input is *also* handed to
+//! `opus.inspect` directly, because the structural parse reports things the
+//! decoder never reaches (TOC framing, padding, frame counts).
 //!
 //! The same `run` function is used by `zig build fuzz` (10,000 rounds) and by a
 //! normal test (1,000 rounds), so CI always exercises it.
@@ -116,10 +117,10 @@ pub fn run(allocator: std.mem.Allocator, rounds: usize, seed: u64) !Stats {
         // where the container/codec distinction lives.
         if (root.probe(buf[0..@min(len, 36)]) != null) stats.probed += 1;
 
-        // The dispatcher answers Unsupported for Opus without parsing a byte
-        // of it, so the structural parser is driven directly: whatever the
-        // mutation did to the head, the tags or the TOC, the failure has to
-        // stay inside the named error set.
+        // The structural parser runs a second time on its own, independently of
+        // whether the decoder gets that far: whatever the mutation did to the
+        // head, the tags or the TOC, the failure has to stay inside the named
+        // error set.
         if (len >= 4 and std.mem.eql(u8, buf[0..4], "OggS")) {
             var structural = std.Io.Reader.fixed(buf[0..len]);
             if (opus.inspect(allocator, &structural, "")) |_| {} else |err| accept(err);

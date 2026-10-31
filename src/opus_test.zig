@@ -50,12 +50,41 @@ test "opus: inspect reads the length from the last granule" {
     try testing.expectEqual(@as(u64, 312 + 3 * 960), info.granule);
     try testing.expectEqual(@as(u64, 3 * 960), info.total_frames);
 
-    // probe names it; open still refuses, after the same full parse.
+    // probe names it, and open succeeds: the container and the head are real,
+    // and a packet's coding mode lives inside the packet, so it cannot be
+    // checked here.
     try testing.expectEqual(root.Format.ogg_opus, root.probe(bytes).?);
     var probe_reader = std.Io.Reader.fixed(bytes);
-    try testing.expectError(error.Unsupported, root.open(testing.allocator, &probe_reader));
+    var opened = try root.open(testing.allocator, &probe_reader);
+    defer opened.deinit();
+
     var open_reader = std.Io.Reader.fixed(bytes);
-    try testing.expectError(error.Unsupported, opus.open(testing.allocator, &open_reader, ""));
+    var direct = try opus.Decoder.open(testing.allocator, &open_reader, "");
+    defer direct.deinit();
+}
+
+test "opus: a SILK packet is Unsupported, not silence" {
+    // Configuration 9 is SILK wideband 20 ms: the CELT layer of this library
+    // cannot decode it, and decoding only the CELT part of a Hybrid packet
+    // would drop the speech band, so both must refuse.
+    const frame = try frameBytes(testing.allocator, 40, 7);
+    defer testing.allocator.free(frame);
+
+    for ([_]u8{ 9, 15 }) |config| {
+        const packet_bytes = try opus_build.packet(testing.allocator, .{
+            .config = config,
+            .frames = &.{frame},
+        });
+        defer testing.allocator.free(packet_bytes);
+        const bytes = try opus_build.file(testing.allocator, .{ .packets = &.{packet_bytes} });
+        defer testing.allocator.free(bytes);
+
+        var reader = std.Io.Reader.fixed(bytes);
+        var dec = try opus.Decoder.open(testing.allocator, &reader, "");
+        defer dec.deinit();
+        var pcm: [64]i16 = undefined;
+        try testing.expectError(error.Unsupported, dec.read(&pcm));
+    }
 }
 
 test "opus: end trimming makes the granule shorter than the packet sum" {

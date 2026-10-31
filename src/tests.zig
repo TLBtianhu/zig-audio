@@ -27,6 +27,8 @@ test {
     _ = @import("vorbis_decode_test.zig");
     _ = @import("ogg_vectors_test.zig");
     _ = @import("opus_vectors_test.zig");
+    _ = @import("opus_celt_test.zig");
+    _ = @import("opus_celt_vectors_test.zig");
     _ = @import("ffmpeg_test.zig");
     _ = @import("fuzz.zig");
 }

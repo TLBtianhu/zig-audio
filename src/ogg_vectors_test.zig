@@ -267,8 +267,11 @@ test "ogg vectors: Opus is identified as Ogg, named Opus, never Vorbis" {
         try testing.expectEqual(root.Format.ogg_opus, root.probe(bytes).?);
         try testing.expectEqual(@as(?root.Format, null), root.probe(bytes[0..12]));
 
+        // `open` succeeds: these are well-formed Ogg Opus streams. What a
+        // stream cannot do is named by `read`, which sees the packet mode.
         var reader = std.Io.Reader.fixed(bytes);
-        try testing.expectError(error.Unsupported, root.open(testing.allocator, &reader));
+        var opened = try root.open(testing.allocator, &reader);
+        opened.deinit();
         ran += 1;
     }
     if (ran == 0) return error.SkipZigTest;

@@ -39,6 +39,16 @@ const Vector = struct {
     configs: []const ConfigCount,
 };
 
+/// Whether this library can decode the file at all: every packet CELT-only and
+/// no packet carrying more than two frames.
+fn decodable(vector: *const Vector) bool {
+    if (vector.frames != vector.packets) return false;
+    for (vector.configs) |entry| {
+        if (entry.config < 16) return false;
+    }
+    return true;
+}
+
 const vectors = [_]Vector{
     .{
         .name = "opus-48k-128-20ms.opus",
@@ -144,12 +154,30 @@ test "opus vectors: header fields, length and packet structure match ffprobe" {
         };
         defer testing.allocator.free(bytes);
 
-        // An `.opus` file is named by probe now, and still refused by open.
+        // An `.opus` file is always named by probe, and a well-formed one always
+        // opens: what a stream can decode is decided per packet, by `read`. The
+        // CELT-only single-frame files must produce samples; the SILK/Hybrid
+        // file and the three-frames-per-packet file must answer `Unsupported`
+        // on the first read rather than invent audio.
         try testing.expectEqual(root.Format.ogg_opus, root.probe(bytes).?);
         var open_reader = std.Io.Reader.fixed(bytes);
-        try testing.expectError(error.Unsupported, root.open(testing.allocator, &open_reader));
+        var opened = try root.open(testing.allocator, &open_reader);
+        defer opened.deinit();
+        var pcm: [8]i16 = undefined;
+        if (decodable(&vector)) {
+            try testing.expect((try opened.read(&pcm)) > 0);
+        } else {
+            try testing.expectError(error.Unsupported, opened.read(&pcm));
+        }
+
         var parse_reader = std.Io.Reader.fixed(bytes);
-        try testing.expectError(error.Unsupported, opus.open(testing.allocator, &parse_reader, ""));
+        var direct = try opus.Decoder.open(testing.allocator, &parse_reader, "");
+        defer direct.deinit();
+        if (decodable(&vector)) {
+            try testing.expect((try direct.read(&pcm)) > 0);
+        } else {
+            try testing.expectError(error.Unsupported, direct.read(&pcm));
+        }
 
         var reader = std.Io.Reader.fixed(bytes);
         const info = try opus.inspect(testing.allocator, &reader, "");

@@ -89,6 +89,7 @@ ffmpeg -v error -y -f lavfi \
 | --- | --- | --- | --- |
 | `mp3-mono-44k-128.mp3` | 1 | 132300 | mono throughput (3 s) |
 | `mp3-stereo-44k-128.mp3` | 2 | 44100 | stereo throughput: two synthesis chains (1 s) |
+| `opus-stereo-48k-128.opus` | 2 | 48000 | Opus CELT throughput: the whole CELT chain on two channels (1 s) |
 
 ## What each fixture covers
 
@@ -101,6 +102,17 @@ ffmpeg -v error -y -f lavfi \
 - MP3: one mono and one stereo tone, for the benchmark only. The MP3 conformance
   corpus lives outside the repository (`..\zig-audio-vectors\mp3`) and the
   intensity-stereo cases are built in memory by `src/mp3_build.zig`.
+- Opus: one 440 Hz stereo tone at 128 kbps with 20 ms frames, so every packet is
+  the CELT-only configuration 31. Used by the benchmark; the conformance corpus
+  lives outside the repository (`..\zig-audio-vectors\ogg`).
+
+## Regenerating
+
+```
+ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=1" -ac 2 \
+       -c:a libopus -b:a 128k -frame_duration 20 -application audio \
+       -f ogg opus-stereo-48k-128.opus
+```
 
 The live ffmpeg integration tests in `src/ffmpeg_test.zig` generate equivalent
 files through a pipe, where ffmpeg writes WAV `data` size `0xFFFFFFFF` and FLAC
