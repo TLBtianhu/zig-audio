@@ -611,10 +611,18 @@ test "vorbis: open parses the complete minimal file and reports total frames" {
     try testing.expectEqual(@as(usize, 1), info.setup.modes.len);
     try testing.expectEqual(@as(u16, 1), info.setup.floors[0].kind());
 
-    // The public dispatcher parses everything, then refuses to produce PCM.
+    // The public dispatcher now produces PCM for the same file. The minimal
+    // template's audio packet is four arbitrary bytes, so what matters here is
+    // that `open` succeeds and `read` reports a clean end of stream.
     var root_reader = std.Io.Reader.fixed(bytes);
-    try testing.expectError(error.Unsupported, root.open(testing.allocator, &root_reader));
-    try testing.expectError(error.Unsupported, root.openBytes(testing.allocator, bytes));
+    var dec = try root.open(testing.allocator, &root_reader);
+    defer dec.deinit();
+    try testing.expectEqual(root.Format.ogg_vorbis, dec.info.format);
+    try testing.expectEqual(@as(u16, 2), dec.info.channels);
+
+    var pcm: [256]i16 = undefined;
+    while (try dec.read(&pcm) != 0) {}
+    try testing.expectEqual(@as(?u64, 1024), dec.info.total_frames);
 }
 
 test "vorbis: open reports Unsupported for Opus and unknown Ogg streams" {

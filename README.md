@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg 本轮只做容器 + Vorbis 头解析（码本 / floor / residue / mapping / mode），PCM 下一轮；Opus 未支持。**
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg Vorbis 完整解码**：容器、三个头包、floor 1 / residue 0-1-2 / 逆耦合 / IMDCT / 重叠相加，两个测试向量整文件对 ffmpeg 的 f32 输出 SNR 131.9–133.4 dB（最大差 < 8e-8）、s16 SNR 98.8–101.0 dB（最大 1 LSB），样本数与 granule 完全一致；floor 0 与 **Opus 未支持**。
 
 ## FLAC：完整支持
 
@@ -66,9 +66,9 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 `zig build bench` 的 MP3 行有两条：3 秒 44.1 kHz/128 kbps 单声道文件约 900x 实时，
 1 秒 44.1 kHz/128 kbps 立体声文件约 570x 实时（ReleaseFast，两者都远高于 100x 目标）。
 
-## Ogg 容器 + Vorbis 头（PCM 下一轮）
+## Ogg Vorbis：完整解码
 
-这一轮只做 **Ogg 容器 + Vorbis 三个头包**，不产出 PCM：`probe` 能认出 Ogg/Vorbis，`open` 把 identification、comment、setup **全部解析完**（码本、floor、residue、mapping、mode），然后返回 `error.Unsupported`，等下一轮接上 floor 曲线与 MDCT 合成。先把头跑通而不是先写半个解码器，是为了让 fuzz 与结构测试立刻覆盖容器和 setup 位流，同时不会给出错误音频。
+Ogg 容器 + Vorbis I **整条解码链**：三个头包、audio packet、floor 曲线、residue（format 0/1/2）、逆耦合、IMDCT、重叠相加。`open` 返回可读 PCM 的 `Decoder`，Opus 仍然明确未支持。
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
@@ -78,15 +78,16 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 | 多逻辑流 | ✅ | 只取**第一个**音频流（按 `\x01vorbis` / `OpusHead` 识别），其余页读过并丢弃；chained 流也忽略 |
 | EOS / 页序号 | ✅ | EOS 结束（其后页不再读）；目标流页序号跳号 → `error.Corrupt` |
 | Vorbis identification / comment | ✅ | 版本、声道、采样率、bitrate 上限/标称/下限、块大小 `2^n`；comment 的 vendor 与条目跳过 |
-| Vorbis setup：码本 | ✅ | ordered / unordered / sparse 三种长度表；lookup type 0/1/2；type 1 的 VQ 表只有 `lookup_values` 个标量，`Codebook.latticeIndex()` 记录 lattice 下标公式 |
-| floor 0 / 1 | ✅ | floor1 校验 X 列表 ≤ 65 且互不重复；子类 book 按 `read8 - 1` 存储，读到 0 表示该子类不用 book |
-| residue 0 / 1 / 2 | ✅ | **先读完所有 cascade，再按 classification 读 book 列表**（不是交错）；classbook / book 越界 → `error.Corrupt` |
-| mapping / mode | ✅ | mapping type 0、耦合步（magnitude ≠ angle）、submap mux、每 submap 的 time/floor/residue；mode 的 window/transform 必须为 0 |
-| `Info.total_frames` | ✅ | 扫描到最后一个 granule（Vorbis 的 PCM 帧数）；没有任何 granule 页时 `null` |
-| PCM 解码 | ⏳ 下一轮 | `open` 返回 `error.Unsupported`，但三份头已经解析完，fuzz/测试现在就在覆盖它们 |
+| Vorbis setup：码本 | ✅ | ordered / unordered / sparse 三种长度表；lookup type 0/1/2；type 1 的 VQ 表只有 `lookup_values` 个标量 |
+| Huffman 解码表 | ✅ | 规范式贪心分配（**同一长度内码字不连续**，所以是 trie 而不是区间查表）+ 10 位快表；内存按*已用*码字计 |
+| floor 0 / 1 | ✅ floor 1 / ❌ floor 0 | floor1 走完整预测+曲线合成；用到 floor 0 的流在 `open` 直接 `error.Unsupported`（不假装静音） |
+| residue 0 / 1 / 2 | ✅ | **先读完所有 cascade，再按 classification 读 book 列表**（不是交错）；classbook digit 从高下标往低填 |
+| mapping / mode | ✅ | mapping type 0、耦合步、submap mux；模式切换的 4 种长窗（normal/start/end/transient） |
+| 逆耦合 | ✅ | **在 residue 向量上、按耦合步逆序**做，符号按 `M>0 / A>0` 四个象限走 square-polar 反变换，不是 `M±A` 蝴蝶 |
+| IMDCT | ✅ | DCT-IV 经两个 M 点复数 FFT；**无归一化因子**（见下） |
+| 重叠相加 | ✅ | 每块输出 `(前块 + 本块)/4` 个样本；首块只用于“预热”，不输出 |
+| `Info.total_frames` | ✅ | 流的最后一个 granule；因为要读到末页才知道，`open` 时是 `null`，`read` 到 EOF 后填上 |
 | Opus | ❌ **未支持** | `probe` 返回 `null`（绝不谎报 Vorbis），`open` 明确返回 `error.Unsupported`，不会崩 |
-
-**位序与 FLAC/MP3 相反**：Vorbis 的位打包是 **LSB-first**（多比特字段的**第一个**读到的位是**最低**位），FLAC/MP3 是 MSB-first。所以 `src/vorbis_bits.zig` 是独立读取器，不复用 `flac_bits.BitReader`。测试里对同一个字节 `0xB5` 做了对照：Vorbis 先读 4 位得到 `0x5`，FLAC/MSB 读取器得到 `0xB`。如果“顺手复用”MSB 读取器，setup 里每个字段都会静默反序。
 
 **验收素材**（在仓库外的 `..\zig-audio-vectors\ogg`，不进 git；缺失时打印一行并 `SkipZigTest`）：
 
@@ -97,7 +98,26 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 | `opus-48k-96.opus` | Opus 96k | — | — | — | — | — | — | — | `probe` null / `open` `Unsupported` |
 | `opus-48k-mono.opus` | Opus 64k | — | — | — | — | — | — | — | 同上 |
 
-ffprobe 只暴露声道、采样率和时长（这个时长正好对上 `total_frames`）；码本 / floor / residue / mode 的数量用一个独立的 Python 参考解析器按 Vorbis I 规范交叉核对，两边逐项一致。坏 CRC（页体翻一字节）→ `error.Corrupt`；截断（页体切 5 字节）→ `error.Truncated`。
+**与 ffmpeg 逐样本对比**（整文件，ffmpeg `-f f32le` / `-f s16le`，样本数完全相同）：
+
+| 素材 | f32 SNR | f32 最大差 | s16 SNR | s16 最大差 |
+| --- | --- | --- | --- | --- |
+| `vorbis-44k-q4.ogg` | **133.42 dB** | 6.7e-08 | **100.96 dB** | 1 LSB |
+| `vorbis-48k-noise.ogg` | **131.93 dB** | 7.5e-08 | **98.78 dB** | 1 LSB |
+
+**对齐：没有任何偏移需要裁。** 首块按规范只做预热（它的右半参与下一块的 lap），其后每块吐 `(前块大小 + 本块大小)/4` 个样本；整条流的样本数刚好等于最后一个 granule，末块按 granule 截断。所以**开头不裁、结尾只按 granule 截断**，与 ffmpeg 的 `-f s16le` 输出长度逐样本一致（132300 / 96000）。Vorbis 不像 MP3 有编码器延迟字段，重叠相加的首块丢弃就是它的“编码器预滚”。
+
+**IMDCT 不做归一化**：教科书的 IMDCT 有 `2/M` 因子，Vorbis 没有——`4/n` 在编码器的前向变换上（参考实现 `mdct_forward` 里乘 `scale`），`mdct_backward` 是裸余弦和。这一条不会体现在波形相关性上（整体缩放一个常数相关系数仍是 1.000000），只体现在绝对电平，所以最容易被漏掉；本库在 `vorbis_dsp.zig` 的两个 dsp 测试里对冲，并在报告里写清。
+
+**floor1 的曲线合成必须整表排序**：X 列表里 `x[0]=0`、`x[1]=2^rangebits` 分别是极小值和极大值，但“画曲线”那一步要对**整个** X 列表按升序排，于是 `x[1]` 排到最后、最后才画。如果只排 2..n-1（保留前两个位置不动），曲线形状会整体错位而位流消耗一位不差——这是一个只在听感/SNR 上暴露、在解析测试里完全看不见的 bug。
+
+**位序与 FLAC/MP3 相反**：Vorbis 的位打包是 **LSB-first**（多比特字段的**第一个**读到的位是**最低**位），FLAC/MP3 是 MSB-first。所以 `src/vorbis_bits.zig` 是独立读取器，不复用 `flac_bits.BitReader`。测试里对同一个字节 `0xB5` 做了对照：Vorbis 先读 4 位得到 `0x5`，FLAC/MSB 读取器得到 `0xB`。如果“顺手复用”MSB 读取器，setup 里每个字段都会静默反序。
+
+**`float32_unpack` 不是 `@bitCast`**：码本的 `minimum_value` / `delta_value` 是 1 位符号 + 21 位整数尾数 + 10 位指数（偏置 788），不是 IEEE-754。按 IEEE 位型直读会得到指数离谱的“合法浮点数”（1.0 读成 2^65），音频变成 1e18 量级的噪声而不是报错。
+
+**`zig build bench` 的 Vorbis 行**：3 秒 44.1 kHz/立体声 q4 循环到 20 秒，约 **380x 实时**（目标 100x，ReleaseFast）。
+
+ffprobe 只暴露声道、采样率和时长（正好对上 `total_frames`）；码本 / floor / residue / mode 的数量用一个独立的 Python 参考解析器按 Vorbis I 规范交叉核对。坏 CRC（页体翻一字节）→ `error.Corrupt`；截断（页体切 5 字节）→ `error.Truncated`，两者都在 `read` 阶段报出（`open` 只读头几页，这是流式解码的应有行为）。
 
 ## 老格式与 Mac 来源：G.711 / ADPCM / AIFF
 
@@ -149,8 +169,10 @@ ffprobe 只暴露声道、采样率和时长（这个时长正好对上 `total_f
 
 - `src/g711_test.zig` / `src/adpcm_test.zig` / `src/aiff_test.zig`：表地标与全表对称性、手算块（含 IMA 饱和、MS 截断除法与立体声交错）、AIFF 各位深与 80 位浮点边界、具名拒绝；
 - `src/legacy_vectors_test.zig`：六个真文件的 `probe`/`Info`/`total_frames` 与 `max_diff 0` 验收（文件缺失时打印一行并 `SkipZigTest`）；
-- 变异 fuzz 模板从 4 个扩到 11 个（六种老格式素材与 Ogg/Vorbis 全部在列），`zig build fuzz` 10000 轮无 panic；
-- bench 新增 4 行：µ-law 8 kHz、IMA/MS ADPCM 44.1 kHz、AIFF PCM16 44.1 kHz，ReleaseFast 下均远高于 100x 目标（本机约 6.6k–400k× 实时）。
+- `src/vorbis_huffman_test.zig` / `vorbis_floor_test.zig` / `vorbis_residue_test.zig` / `vorbis_dsp_test.zig`：规范里那张 8 码字示例表的逐码字回读、稀疏与单码字码本、截断/不可达码、trie 深码、X 列表整表排序（曲线形状回归）、`render_point` 整数插值、dB 表单调性、residue 三种格式的样本落点、IMDCT 对直接余弦和、四种窗形与重叠相加；
+- `src/vorbis_decode_test.zig`：两个 Ogg/Vorbis 真文件**整文件**对 ffmpeg 的 f32 与 s16 输出，逐样本 SNR / 最大差 / 样本数，以及 `ShortBuffer` 与 granule 截断；
+- 变异 fuzz 模板从 4 个扩到 11 个（六种老格式素材与 Ogg/Vorbis 全部在列；Ogg 模板现在真的走完整条解码链），`zig build fuzz` 10000 轮无 panic（本轮 667 万样本）；
+- bench 共 11 行：本轮新增 Ogg Vorbis q4 立体声（约 380x 实时），其余老格式行 6.6k–400k× 实时，均远高于 100x 目标。
 
 ## 这不是 Zig 版 FFmpeg
 

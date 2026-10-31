@@ -46,8 +46,10 @@ pub const BitWriter = struct {
         try self.bytes.appendSlice(self.allocator, bytes);
     }
 
+    /// Codebook minimum/delta are stored in Vorbis's packed float format, not as
+    /// IEEE-754 bits: see `vorbis_bits.float32Pack`.
     pub fn writeF32(self: *BitWriter, value: f32) !void {
-        try self.writeBits(@bitCast(value), 32);
+        try self.writeBits(vorbis_bits.float32Pack(value), 32);
     }
 
     pub fn take(self: *BitWriter) ![]u8 {

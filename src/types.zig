@@ -8,8 +8,8 @@ pub const Format = enum {
     flac,
     mp3,
     aiff,
-    /// Ogg container carrying a Vorbis stream. Header parsing only in this
-    /// version; the public `open` reports `Unsupported` after parsing them.
+    /// Ogg container carrying a Vorbis stream, fully decoded: floor 1, residue
+    /// 0/1/2, inverse coupling, IMDCT and the lap.
     ogg_vorbis,
 };
 

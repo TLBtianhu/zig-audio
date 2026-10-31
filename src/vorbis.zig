@@ -2,8 +2,8 @@
 //!
 //! The setup header is parsed in specification order: codebooks, time-domain
 //! placeholders, floors, residues, mappings, modes, framing bit. Codebooks and
-//! floors are the large part; the parse stores everything a PCM decoder will
-//! need, but this stage deliberately stops before audio packets.
+//! floors are the large part; the parse stores everything the audio decoder
+//! (`vorbis_decoder.zig`) needs.
 //!
 //! Bit order is the Vorbis convention, LSB-first (see `vorbis_bits.zig`), which
 //! is the opposite of `flac_bits` and `mp3_bits`. A shared MSB reader would
@@ -11,9 +11,9 @@
 //! choice.
 //!
 //! `open` walks the whole first audio stream to read its last granule position
-//! (total PCM frames), so `Info.total_frames` is known even though decoding is
-//! not implemented yet. The public dispatcher turns the resulting `Info` into
-//! `error.Unsupported` after this parse has run.
+//! (total PCM frames), which is how the header-only view reports a length. The
+//! public dispatcher does not use it: it streams instead, so `total_frames`
+//! there becomes known only at end of stream.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -197,7 +197,7 @@ pub const Info = struct {
     }
 };
 
-const Identification = struct {
+pub const Identification = struct {
     version: u32,
     channels: u16,
     sample_rate: u32,
@@ -579,8 +579,9 @@ fn parseMapping(
 }
 
 /// Open the first Vorbis stream in `reader`, parse all three headers, and scan
-/// to its end for the last granule position. PCM decode is not implemented in
-/// this stage; callers see `error.Unsupported` from the public `open`.
+/// to its end for the last granule position. Header-only view: it consumes the
+/// whole stream to learn the length and produces no PCM; the public dispatcher
+/// uses `vorbis_decoder.Decoder`, which streams.
 pub fn open(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,

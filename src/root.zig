@@ -2,14 +2,13 @@
 //!
 //! WAV (PCM, IEEE float, G.711 µ-law/A-law, IMA and Microsoft ADPCM), AIFF
 //! (big-endian PCM), FLAC (CONSTANT, VERBATIM, FIXED(0..4), LPC(1..32)) and
-//! mono/stereo MPEG-1 Layer III decoders, plus Ogg container and Vorbis header
-//! parsing. The FLAC side covers Rice partitions, independent channels and the
+//! mono/stereo MPEG-1 Layer III decoders, plus a complete Ogg Vorbis decoder.
+//! The FLAC side covers Rice partitions, independent channels and the
 //! left/side, right/side and mid/side assignments; the MP3 side covers long and
-//! window-switched (start/short/stop) granules, mid/side and intensity stereo.
-//! The Ogg side stops at the setup header in this version: `open` parses all
-//! three Vorbis headers and returns `Unsupported` because PCM synthesis is the
-//! next stage; Opus is recognized and rejected. See README for the support
-//! matrix.
+//! window-switched (start/short/stop) granules, mid/side and intensity stereo;
+//! the Ogg side covers the container, the three Vorbis headers, floor 1, residue
+//! formats 0/1/2, inverse coupling, the IMDCT and the lap. Floor 0 and Opus are
+//! not supported and are named as such. See README for the support matrix.
 //!
 //! The API deliberately has one output path: interleaved i16. Source PCM
 //! (8/16/24/32) and float32 are converted inside the decoder, so a player
@@ -23,6 +22,7 @@ const flac = @import("flac.zig");
 const mp3 = @import("mp3.zig");
 const ogg = @import("ogg.zig");
 const vorbis = @import("vorbis.zig");
+const vorbis_decoder = @import("vorbis_decoder.zig");
 
 pub const Format = types.Format;
 pub const Info = types.Info;
@@ -94,9 +94,9 @@ pub fn probe(header: []const u8) ?Format {
 /// `data` payload. The reader is borrowed: the caller owns it and must keep it
 /// alive longer than the returned `Decoder`.
 ///
-/// For Ogg this version parses the pages and all three Vorbis headers, scans to
-/// the last page for `total_frames`, and then returns `error.Unsupported`
-/// because PCM synthesis is not implemented yet. Opus and unknown Ogg logical
+/// For Ogg this version parses the container and all three Vorbis headers and
+/// returns a streaming decoder; `total_frames` is the stream's last granule, so
+/// it stays `null` until `read` reaches the end. Opus and unknown Ogg logical
 /// streams return `error.Unsupported` without producing a decoder.
 pub fn open(allocator: std.mem.Allocator, reader: *std.Io.Reader) Error!Decoder {
     var header: [12]u8 = undefined;
@@ -147,14 +147,15 @@ pub fn open(allocator: std.mem.Allocator, reader: *std.Io.Reader) Error!Decoder 
     }
 
     if (std.mem.eql(u8, header[0..4], "OggS")) {
-        // Ogg Vorbis: parse the container and all three headers, then report
-        // Unsupported because PCM synthesis is the next stage. Parsing before
-        // returning is what makes the fuzzer and the vector tests cover the
-        // setup header today instead of after the decoder lands. Opus and
-        // unknown logical streams also land here and name Unsupported.
-        var info = try vorbis.open(allocator, reader, &header);
-        info.deinit(allocator);
-        return error.Unsupported;
+        // Ogg Vorbis: the container names the codec in its first packet, so an
+        // Ogg page that does not carry `\x01vorbis` is Opus or something else
+        // and is named Unsupported rather than NotAudio.
+        const dec = try vorbis_decoder.Decoder.open(allocator, reader, &header);
+        return .{
+            .info = dec.info,
+            .allocator = allocator,
+            .impl = .{ .ogg_vorbis = dec },
+        };
     }
 
     // Recognize the containers we reject, so the error is Unsupported rather
@@ -226,6 +227,7 @@ pub const Decoder = struct {
         aiff: aiff.Decoder,
         flac: flac.Decoder,
         mp3: mp3.Decoder,
+        ogg_vorbis: vorbis_decoder.Decoder,
     },
     /// Non-null only for `openBytes` / `openFile*`: reader state owned by this
     /// decoder. Plain `open` borrows the caller's reader and leaves it null.
@@ -254,6 +256,13 @@ pub const Decoder = struct {
             .aiff => |*dec| return dec.read(out),
             .flac => |*dec| return dec.read(out),
             .mp3 => |*dec| return dec.read(out),
+            .ogg_vorbis => |*dec| {
+                const written = try dec.read(out);
+                // Vorbis length lives in the stream's last granule position, so
+                // it becomes known only when the last page has been read.
+                self.info.total_frames = dec.info.total_frames;
+                return written;
+            },
         }
     }
 
@@ -266,6 +275,7 @@ pub const Decoder = struct {
             .aiff => |*dec| dec.deinit(),
             .flac => |*dec| dec.deinit(),
             .mp3 => |*dec| dec.deinit(),
+            .ogg_vorbis => |*dec| dec.deinit(),
         }
         if (self.source) |source| switch (source) {
             .bytes => |reader| self.allocator.destroy(reader),

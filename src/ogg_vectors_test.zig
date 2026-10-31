@@ -97,10 +97,12 @@ test "ogg vectors: Vorbis headers match ffprobe and the reference parser" {
         var info = try parseInfo(testing.allocator, bytes);
         defer info.deinit(testing.allocator);
 
-        // The public path parses the same headers and then declines to produce
-        // PCM, which is the contract for this stage.
+        // The public path opens the same stream and decodes it; the full PCM
+        // comparison against ffmpeg lives in `vorbis_decode_test.zig`.
         var root_reader = std.Io.Reader.fixed(bytes);
-        try testing.expectError(error.Unsupported, root.open(testing.allocator, &root_reader));
+        var dec = try root.open(testing.allocator, &root_reader);
+        defer dec.deinit();
+        try testing.expectEqual(root.Format.ogg_vorbis, dec.info.format);
 
         try testing.expectEqual(vector.channels, info.channels);
         try testing.expectEqual(vector.sample_rate, info.sample_rate);
@@ -304,11 +306,41 @@ test "ogg vectors: a flipped body byte is Corrupt, a cut page is Truncated" {
         defer testing.allocator.free(damaged);
         damaged[corrupt_at.?] ^= 0x40;
         var reader = std.Io.Reader.fixed(damaged);
-        try testing.expectError(error.Corrupt, root.open(testing.allocator, &reader));
+        // The headers are on earlier pages, so `open` succeeds and the damaged
+        // page is only reached by `read`; that is what streaming means here.
+        var dec = try root.open(testing.allocator, &reader);
+        defer dec.deinit();
+        var pcm: [1024]i16 = undefined;
+        var saw_corrupt = false;
+        while (true) {
+            const n = dec.read(&pcm) catch |err| switch (err) {
+                error.Corrupt => {
+                    saw_corrupt = true;
+                    break;
+                },
+                else => return err,
+            };
+            if (n == 0) break;
+        }
+        try testing.expect(saw_corrupt);
     }
     {
         const truncated = bytes[0..cut_at.?];
         var reader = std.Io.Reader.fixed(truncated);
-        try testing.expectError(error.Truncated, root.open(testing.allocator, &reader));
+        var dec = try root.open(testing.allocator, &reader);
+        defer dec.deinit();
+        var pcm: [1024]i16 = undefined;
+        var saw_truncated = false;
+        while (true) {
+            const n = dec.read(&pcm) catch |err| switch (err) {
+                error.Truncated => {
+                    saw_truncated = true;
+                    break;
+                },
+                else => return err,
+            };
+            if (n == 0) break;
+        }
+        try testing.expect(saw_truncated);
     }
 }
