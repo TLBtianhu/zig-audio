@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）目前支持**单声道**：四个测试向量（32/44.1/48 kHz，CBR 与 VBR）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 1e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换，见下文。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。
 
 ## FLAC：完整支持
 
@@ -31,25 +31,40 @@
 
 `61 - predictor overflow check` 的预测值达到 860128（远超 16 位样本范围），而累加和最大约 8.8×10⁸；它检验的是"预测值不能按 bps 截断"，不是 32 位累加和溢出。真正超过 32 位的累加和由合成用例覆盖：`Σ = 32 × 16383 × 32767 = 17178296352`（约为 2³⁴、i32 上限的 8 倍），i32 回绕会预测出 −48 而不是 524240。
 
-## MP3：MPEG-1 Layer III 单声道（实验中）
+## MP3：MPEG-1 Layer III 单声道 + 立体声（实验中）
 
 已实现：帧同步与头解析、ID3v2/ID3v1/APE/Lyrics3 跳过、Xing/Info + LAME delay/padding、
-MPEG-1 单声道 side info、跨帧 bit reservoir、ISO Table B.7 的 32 张 Huffman 表（表 0–31，
-含 linbits 与 count1 A/B）、scalefactors、反量化、short block 重排、抗混叠、18/12 点 IMDCT、
-频率反转、32 子带多相合成，以及 gapless 裁剪（delay + 529 样点滤波器延迟）。
+MPEG-1 单声道与立体声 side info（每 granule 4 个 channel 块）、跨帧 bit reservoir、
+ISO Table B.7 的 32 张 Huffman 表（表 0–31，含 linbits 与 count1 A/B）、scalefactors、
+反量化、joint stereo（mid/side 与 intensity，含 `is_pos` 0–7）、short block 重排、抗混叠、
+18/12 点 IMDCT、频率反转、32 子带多相合成（每声道一条），以及 gapless 裁剪
+（delay + 529 样点滤波器延迟）。
 
 | 能力 | 状态 |
 | --- | --- |
 | MPEG-1 Layer III / 单声道 | ✅ |
-| MPEG-2/2.5、Layer I/II、立体声/联合立体声 | `error.Unsupported` |
-| 长块（normal） | 四个向量逐 granule 与 ffmpeg 相差 < 1e-6（f32），s16 最大 1 LSB |
+| MPEG-1 Layer III / 立体声（`mode` 00/10，两声道独立） | ✅ |
+| MPEG-1 Layer III / 联合立体声（`mode` 01）：mid/side、intensity | ✅ |
+| MPEG-2/2.5、Layer I/II | `error.Unsupported` |
+| 长块（normal） | 八个向量（单/双声道）逐 granule 与 ffmpeg 相差 < 2e-6（f32），s16 最大 1 LSB |
 | short/start/stop 窗口 | 同上；1 秒静音 + 10 ms 脉冲的 start→short→short→stop 回归测试 SNR 121.6 dB |
+| intensity stereo | 语料里没有（LAME 不产生 intensity），用 `src/mp3_build.zig` 手工构造的流对 ffmpeg 验证：SNR 122.9 dB |
+
+**立体声顺序**：反量化（两声道）→ joint stereo → 重排 → 抗混叠 → IMDCT → 各自多相合成。
+MS 与 intensity 都作用在**反量化后的 `xr`** 上，必须在抗混叠之前：抗混叠是单声道内部相邻谱线的
+旋转，先做会把两个声道的混叠项转到错误的邻带上；IMDCT 之后更是时域样本，`M + S` 已不成立。
+`mode_extension` 逐帧读取（LAME 会在帧之间开关 MS）。MS-only 帧的 `global_gain` 减 2 个
+四分之一指数（1/√2 归一化，编码器放在增益里）；intensity+MS 同时开启时该因子落在 MS 频带上。
+`is_pos == 7` 按规范把该频带清零（不是缩放）；ffmpeg 把 ≥7 当作"不是 intensity 位置"并沿用左声道，
+这是本库唯一有意与 ffmpeg 不同的地方，合成用例里同时记录了两边的峰值（本库 0，ffmpeg 0.43）。
 
 验收判据（见 `src/mp3_vectors_test.zig`）：f32 与 ffmpeg 比 SNR ≥ 90 dB、逐 granule 最大差 < 1e-4；
-s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SNR 不得塌陷；样本总数与 ffmpeg 完全一致。
-s16 的上限来自两边不同的 i16 舍入规则（满幅时约 0.5 LSB ≈ 72 dB），所以两条判据不同。
+s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SNR 不得塌陷；样本总数与 ffmpeg 完全一致
+（立体声按每声道计，交错样本数是两倍）。s16 的上限来自两边不同的 i16 舍入规则
+（满幅时约 0.5 LSB ≈ 72 dB），所以两条判据不同。
 
-`zig build bench` 的 MP3 行用 3 秒 44.1 kHz/128 kbps 单声道文件，ReleaseFast 下约 800x 实时。
+`zig build bench` 的 MP3 行有两条：3 秒 44.1 kHz/128 kbps 单声道文件约 900x 实时，
+1 秒 44.1 kHz/128 kbps 立体声文件约 570x 实时（ReleaseFast，两者都远高于 100x 目标）。
 
 ## 这不是 Zig 版 FFmpeg
 
@@ -408,7 +423,7 @@ zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）解�
 
 集成测试会尝试调用本机 ffmpeg（Windows 路径写死为开发机上的位置）；路径不存在或不是 Windows 时测试自动 `SkipZigTest`，CI 不依赖 ffmpeg。
 
-除了实时 ffmpeg 测试，仓库还提交了 **0.02 秒的 ffmpeg 生成样本**（`src/fixtures/`，总计约 90 KB）：没有 ffmpeg 的 CI 也能解码真实的 PCM8/16/24/32、float32、5.1 WAV，以及固定预测和 LPC（mono 8 kHz、stereo 44.1 kHz order 32 mid/side）的 FLAC；其中的 stereo LPC 文件还与其同源 WAV 逐样本一致。
+除了实时 ffmpeg 测试，仓库还提交了 **0.02 秒的 ffmpeg 生成样本**（`src/fixtures/`，总计约 110 KB）：没有 ffmpeg 的 CI 也能解码真实的 PCM8/16/24/32、float32、5.1 WAV，以及固定预测和 LPC（mono 8 kHz、stereo 44.1 kHz order 32 mid/side）的 FLAC；其中的 stereo LPC 文件还与其同源 WAV 逐样本一致。
 
 - `tools/fetch-vectors.ps1`：把 13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 官方向量下载到 `.zig-cache/vectors/`，逐个做 SHA-256 校验；向量不进 git。向量缺失时 FLAC 测试打印一行说明并 `SkipZigTest`，不会失败。
 - `src/compare.zig`：测试辅助。把本库解出的 i16 与 ffmpeg 的 `-f s16le`、`-f s32le >> 16` 逐样本比较，并支持“截断流的可解前缀”对比（60 号向量的 50% 截断用例）。

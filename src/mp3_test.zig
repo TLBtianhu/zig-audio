@@ -70,10 +70,20 @@ test "MPEG-2 version and Layer II are Unsupported" {
     try testing.expectError(error.Unsupported, root.open(testing.allocator, &reader2));
 }
 
-test "stereo mode is Unsupported" {
+test "stereo mode yields two interleaved channels" {
     const stereo = monoFrame(.{ 0xFF, 0xFB, 0x90, 0x00 }, 0);
-    var reader = std.Io.Reader.fixed(&stereo);
-    try testing.expectError(error.Unsupported, root.open(testing.allocator, &reader));
+    const samples = try readAll(testing.allocator, &stereo);
+    defer testing.allocator.free(samples);
+    try testing.expectEqual(@as(usize, 2304), samples.len);
+    for (samples) |s| try testing.expectEqual(@as(i16, 0), s);
+}
+
+test "dual channel mode is stereo and mono stays mono" {
+    const dual = monoFrame(.{ 0xFF, 0xFB, 0x90, 0x80 }, 0);
+    var reader = std.Io.Reader.fixed(&dual);
+    var dec = try root.open(testing.allocator, &reader);
+    defer dec.deinit();
+    try testing.expectEqual(@as(u16, 2), dec.info.channels);
 }
 
 test "bad bitrate index is Corrupt and a short frame is Truncated" {
@@ -97,12 +107,14 @@ test "reservoir start beyond history is Corrupt" {
 
 test "side info exposes zero lengths and block type 0" {
     const zero: [17]u8 = @splat(0);
-    const side = try frame.parseSideInfo(&zero);
+    const side = try frame.parseSideInfo(&zero, 1);
     try testing.expectEqual(@as(u16, 0), side.main_data_begin);
-    for (side.granules) |g| {
-        try testing.expectEqual(@as(u16, 0), g.part2_3_length);
-        try testing.expectEqual(@as(u16, 0), g.big_values);
-        try testing.expectEqual(@as(u2, 0), g.block_type);
+    for (side.granules) |granule| {
+        for (granule) |g| {
+            try testing.expectEqual(@as(u16, 0), g.part2_3_length);
+            try testing.expectEqual(@as(u16, 0), g.big_values);
+            try testing.expectEqual(@as(u2, 0), g.block_type);
+        }
     }
 }
 

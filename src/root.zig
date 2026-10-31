@@ -1,10 +1,10 @@
 //! zig-audio: streaming audio decoding in pure Zig.
 //!
-//! WAV, FLAC (CONSTANT, VERBATIM, FIXED(0..4), LPC(1..32)) and mono MPEG-1
-//! Layer III decoders. The FLAC side covers Rice partitions, independent
+//! WAV, FLAC (CONSTANT, VERBATIM, FIXED(0..4), LPC(1..32)) and mono/stereo
+//! MPEG-1 Layer III decoders. The FLAC side covers Rice partitions, independent
 //! channels and the left/side, right/side and mid/side assignments; the MP3
-//! side covers long and window-switched (start/short/stop) granules. See
-//! README for the support matrix.
+//! side covers long and window-switched (start/short/stop) granules, mid/side
+//! and intensity stereo. See README for the support matrix.
 //!
 //! The API deliberately has one output path: interleaved i16. Source PCM
 //! (8/16/24/32) and float32 are converted inside the decoder, so a player

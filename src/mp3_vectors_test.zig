@@ -1,8 +1,8 @@
 //! MP3 conformance against ffmpeg's decoder, and the window-switching
 //! regression that motivated this file.
 //!
-//! The four vectors are NOT committed; they live next to the repository in
-//! `..\zig-audio-vectors\mp3` (the first one is also committed under
+//! The stereo vectors are NOT committed; they live next to the repository in
+//! `..\zig-audio-vectors\mp3` (the mono fixture is also committed under
 //! `src/fixtures`). When a file is absent the test prints a line and moves on,
 //! so a checkout without the corpus stays green.
 //!
@@ -32,6 +32,7 @@ const Vector = struct {
     path: []const u8,
     fallback: ?[]const u8 = null,
     label: []const u8,
+    channels: usize = 1,
 };
 
 const vectors = [_]Vector{
@@ -39,6 +40,10 @@ const vectors = [_]Vector{
     .{ .path = vector_dir ++ "\\mono-32k-64.mp3", .label = "32 kHz 64k" },
     .{ .path = vector_dir ++ "\\mono-48k-192.mp3", .label = "48 kHz 192k" },
     .{ .path = vector_dir ++ "\\mono-44k-vbr.mp3", .label = "44.1 kHz VBR noise" },
+    .{ .path = vector_dir ++ "\\stereo-44k-192.mp3", .label = "44.1 kHz stereo 192k", .channels = 2 },
+    .{ .path = vector_dir ++ "\\stereo-44k-vbr-ms.mp3", .label = "44.1 kHz VBR joint stereo", .channels = 2 },
+    .{ .path = vector_dir ++ "\\stereo-48k-128-lr.mp3", .label = "48 kHz stereo 128k LR", .channels = 2 },
+    .{ .path = vector_dir ++ "\\viper.mp3", .label = "viper.mp3 real music (MS)", .channels = 2 },
 };
 
 fn readVector(allocator: std.mem.Allocator, v: Vector) ![]u8 {
@@ -73,15 +78,18 @@ const F32Result = struct {
     worst_granule: usize,
 };
 
-fn analyseF32(ours: []const f32, ref: []const f32) F32Result {
+/// A "granule" is 576 frames, i.e. `576 * channels` interleaved samples, so
+/// the per-granule bound applies to the same span as the mono analysis.
+fn analyseF32(ours: []const f32, ref: []const f32, channels: usize) F32Result {
+    const span = 576 * channels;
     var sig: f64 = 0;
     var err: f64 = 0;
     var maxd: f64 = 0;
     var worst: usize = 0;
     var g: usize = 0;
-    while (g * 576 < ref.len) : (g += 1) {
-        const a = g * 576;
-        const b = @min(a + 576, ref.len);
+    while (g * span < ref.len) : (g += 1) {
+        const a = g * span;
+        const b = @min(a + span, ref.len);
         var gmax: f64 = 0;
         for (a..b) |i| {
             const d: f64 = @abs(@as(f64, ours[i]) - @as(f64, ref[i]));
@@ -109,7 +117,8 @@ const S16Result = struct {
     segment_start: usize,
 };
 
-fn analyseS16(ours: []const i16, ref: []const i16) S16Result {
+fn analyseS16(ours: []const i16, ref: []const i16, channels: usize) S16Result {
+    const span = 576 * channels;
     var sig: f64 = 0;
     var err: f64 = 0;
     var maxd: u16 = 0;
@@ -124,9 +133,9 @@ fn analyseS16(ours: []const i16, ref: []const i16) S16Result {
     var seg_snr: f64 = std.math.inf(f64);
     var seg_start: usize = 0;
     var g0: usize = 0;
-    while (g0 * 576 < ref.len) : (g0 += 20) {
-        const a = g0 * 576;
-        const b = @min(a + 20 * 576, ref.len);
+    while (g0 * span < ref.len) : (g0 += 20) {
+        const a = g0 * span;
+        const b = @min(a + 20 * span, ref.len);
         var s2: f64 = 0;
         var e2: f64 = 0;
         for (a..b) |i| {
@@ -168,7 +177,7 @@ fn checkVector(
         return error.SampleCountMismatch;
     }
 
-    const rf = analyseF32(ours_f, ref_f);
+    const rf = analyseF32(ours_f, ref_f, v.channels);
     std.debug.print(
         "{s}: f32 SNR {d:.2} dB, max {e:.3} (granule {d})\n",
         .{ v.label, rf.snr, rf.max, rf.worst_granule },
@@ -184,16 +193,17 @@ fn checkVector(
     defer allocator.free(ref_s);
     if (ours_s.len != ref_s.len) return error.SampleCountMismatch;
 
-    const rs = analyseS16(ours_s, ref_s);
+    const rs = analyseS16(ours_s, ref_s, v.channels);
     if (print_segments) {
         std.debug.print(
             "{s}: s16 SNR {d:.2} dB, max {d} LSB, worst 20-granule segment {d:.1} dB at {d}\n",
             .{ v.label, rs.snr, rs.max, rs.segment_snr, rs.segment_start },
         );
+        const span = 576 * v.channels;
         var g0: usize = 0;
-        while (g0 * 576 < ref_s.len) : (g0 += 20) {
-            const a = g0 * 576;
-            const b = @min(a + 20 * 576, ref_s.len);
+        while (g0 * span < ref_s.len) : (g0 += 20) {
+            const a = g0 * span;
+            const b = @min(a + 20 * span, ref_s.len);
             var s2: f64 = 0;
             var e2: f64 = 0;
             for (a..b) |i| {
@@ -313,7 +323,7 @@ test "mp3 transient: start/short/stop switching is sample-accurate" {
     defer testing.allocator.free(ref);
     if (ours.len != ref.len) return error.SampleCountMismatch;
 
-    const r = analyseF32(ours, ref);
+    const r = analyseF32(ours, ref, 1);
     std.debug.print(
         "transient: f32 SNR {d:.2} dB, max {e:.3} (granule {d}, 0 = start block)\n",
         .{ r.snr, r.max, r.worst_granule },

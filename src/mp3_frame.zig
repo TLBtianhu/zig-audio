@@ -30,55 +30,69 @@ pub const GranuleInfo = struct {
 
 pub const SideInfo = struct {
     main_data_begin: u16,
-    granules: [2]GranuleInfo,
+    /// `[granule][channel]`. A mono frame uses channel 0 only; an MPEG-1
+    /// stereo frame has four blocks, granule-major: gr0ch0, gr0ch1, gr1ch0,
+    /// gr1ch1 -- not channel-major.
+    granules: [2][2]GranuleInfo,
 };
 
-pub fn parseSideInfo(si: []const u8) Error!SideInfo {
-    if (si.len < 17) return error.Corrupt;
-    var br = bits.BitReader.init(si);
-    var side: SideInfo = undefined;
+/// MPEG-1 side info is 17 bytes for one channel and 32 for two: 9
+/// main_data_begin bits, 5 (mono) or 3 (stereo) private bits, 4 scfsi bits
+/// *per channel*, then 59 bits per granule/channel block.
+pub fn parseSideInfo(si: []const u8, channels: usize) Error!SideInfo {
+    const len: usize = if (channels == 2) 32 else 17;
+    if (si.len < len) return error.Corrupt;
+    var br = bits.BitReader.init(si[0..len]);
+    var side: SideInfo = std.mem.zeroes(SideInfo);
     side.main_data_begin = @intCast(br.read(9));
-    _ = br.read(5); // private bits
-    const scfsi: u8 = @intCast(br.read(4));
+    _ = br.read(if (channels == 2) 3 else 5); // private bits
+    var scfsi: [2]u8 = .{ 0, 0 };
+    for (0..channels) |ch| scfsi[ch] = @intCast(br.read(4));
 
     for (0..2) |g| {
-        var info: GranuleInfo = undefined;
-        info.part2_3_length = @intCast(br.read(12));
-        info.big_values = @intCast(br.read(9));
-        if (info.big_values > 288) return error.Corrupt;
-        info.global_gain = @intCast(br.read(8));
-        info.scalefac_compress = @intCast(br.read(4));
-        info.scfsi = if (g == 1) scfsi else 0;
-        info.preflag = false;
-        info.scalefac_scale = 0;
-        info.count1table_select = 0;
-        info.region0 = 0;
-        info.region1 = 0;
-        info.subblock_gain = .{ 0, 0, 0 };
-        info.table_select = .{ 0, 0, 0 };
-
-        if (br.read(1) != 0) {
-            info.block_type = @intCast(br.read(2));
-            if (info.block_type == 0) return error.Corrupt;
-            info.mixed = br.read(1) != 0;
-            info.table_select[0] = @intCast(br.read(5));
-            info.table_select[1] = @intCast(br.read(5));
-            info.table_select[2] = 0;
-            for (0..3) |i| info.subblock_gain[i] = @intCast(br.read(3));
-        } else {
-            info.block_type = 0;
-            info.mixed = false;
-            for (0..3) |i| info.table_select[i] = @intCast(br.read(5));
-            info.region0 = @intCast(br.read(4));
-            info.region1 = @intCast(br.read(3));
+        for (0..channels) |ch| {
+            side.granules[g][ch] = try parseGranule(&br, if (g == 1) scfsi[ch] else 0);
         }
-        info.preflag = br.read(1) != 0;
-        info.scalefac_scale = @intCast(br.read(1));
-        info.count1table_select = @intCast(br.read(1));
-        side.granules[g] = info;
     }
-    if (br.pos != 136) return error.Corrupt;
+    if (br.pos != len * 8) return error.Corrupt;
     return side;
+}
+
+fn parseGranule(br: *bits.BitReader, scfsi: u8) Error!GranuleInfo {
+    var info: GranuleInfo = undefined;
+    info.part2_3_length = @intCast(br.read(12));
+    info.big_values = @intCast(br.read(9));
+    if (info.big_values > 288) return error.Corrupt;
+    info.global_gain = @intCast(br.read(8));
+    info.scalefac_compress = @intCast(br.read(4));
+    info.scfsi = scfsi;
+    info.preflag = false;
+    info.scalefac_scale = 0;
+    info.count1table_select = 0;
+    info.region0 = 0;
+    info.region1 = 0;
+    info.subblock_gain = .{ 0, 0, 0 };
+    info.table_select = .{ 0, 0, 0 };
+
+    if (br.read(1) != 0) {
+        info.block_type = @intCast(br.read(2));
+        if (info.block_type == 0) return error.Corrupt;
+        info.mixed = br.read(1) != 0;
+        info.table_select[0] = @intCast(br.read(5));
+        info.table_select[1] = @intCast(br.read(5));
+        info.table_select[2] = 0;
+        for (0..3) |i| info.subblock_gain[i] = @intCast(br.read(3));
+    } else {
+        info.block_type = 0;
+        info.mixed = false;
+        for (0..3) |i| info.table_select[i] = @intCast(br.read(5));
+        info.region0 = @intCast(br.read(4));
+        info.region1 = @intCast(br.read(3));
+    }
+    info.preflag = br.read(1) != 0;
+    info.scalefac_scale = @intCast(br.read(1));
+    info.count1table_select = @intCast(br.read(1));
+    return info;
 }
 
 fn exponentScale(exponent: i32) f32 {
@@ -92,13 +106,17 @@ fn dequant(magnitude: u16, exponent: i32, negative: bool) f32 {
     return if (negative) -v else v;
 }
 
+/// Read one channel's scalefactors into `out_sf[0..39]`.
+///
+/// `out_sf` doubles as the `scfsi` history: granule 1 is handed the same array
+/// as `prev`, so a "reuse" group reads back what granule 0 stored there.
 fn readScaleFactors(
     gi: *const GranuleInfo,
     br: *bits.BitReader,
     prev: ?*const [22]u8,
-    out_long: *[22]u8,
-) [40]u8 {
-    var sf: [40]u8 = @splat(0);
+    out_sf: *[40]u8,
+) void {
+    const sf = out_sf;
     const slen1 = tables.slen1[gi.scalefac_compress & 15];
     const slen2 = tables.slen2[gi.scalefac_compress & 15];
 
@@ -130,19 +148,31 @@ fn readScaleFactors(
             }
             j += n;
         }
-        out_long.* = sf[0..22].*;
+        // 6 + 5 + 5 + 5 = 21 scalefactors are transmitted for a long block; the
+        // 22nd band's scalefactor is implicit and always zero. Leaving the slot
+        // untouched would let it hold the previous granule's value.
+        sf[21] = 0;
     }
-    return sf;
 }
 
-fn fillExponents(gi: *const GranuleInfo, sr_idx: usize, sf: *const [40]u8, exp: *[576]i16) void {
+fn fillExponents(
+    gi: *const GranuleInfo,
+    sr_idx: usize,
+    sf: *const [40]u8,
+    exp: *[576]i16,
+    gain_bias: i32,
+) void {
     // ISO 11172-3 2.4.3.4.8: exponent = global_gain - 210 - 8*subblock_gain
     //            - 2*(scalefac_scale+1)*scalefac, in quarter-exponent units.
     // The scalefactor step is 2^(0.5*(1+scalefac_scale)) -- half a power of two
     // at scalefac_scale=0 -- not a whole one. Using 4*shift here squares the
     // attenuation and was the audible window-switching bug: long blocks with
     // all-zero scalefactors were unaffected, every short block was quiet.
-    const gain: i32 = @as(i32, gi.global_gain) - 210;
+    //
+    // `gain_bias` carries the -2 quarter-steps a mid/side-only frame needs: the
+    // encoder normalises M and S by 1/sqrt(2), which the decoder folds into the
+    // global gain rather than scaling the spectrum after requantization.
+    const gain: i32 = @as(i32, gi.global_gain) - 210 + gain_bias;
     const shift: i32 = @as(i32, gi.scalefac_scale) + 1;
     var line: usize = 0;
 
@@ -282,34 +312,59 @@ fn reorder(xr: *[576]f32, sr_idx: usize, mixed: bool) void {
     }
 }
 
-/// Decode one granule into 576 i16 samples. `out_f32`, when non-null, also
-/// receives the same 576 samples before the fixed-point conversion; the SNR
-/// tests use it to compare against ffmpeg's `-f f32le` output.
-pub fn decodeGranule(
+/// Per-channel decoder state that outlives one granule: the IMDCT overlap
+/// half, the polyphase synthesis delay line and the previous granule's long
+/// scalefactors (for `scfsi`).
+pub const ChannelState = struct {
+    overlap: [32][18]f32 = @splat(@splat(0)),
+    synth_state: synth.SynthState = .{},
+};
+
+/// Decode one channel block into 576 requantized spectral lines.
+///
+/// The lines come out in the order the Huffman decoder produced them: for a
+/// window-switched granule that is still the interleaved short-block layout, so
+/// `renderChannel` owns the reordering step. Joint stereo runs between the two
+/// functions, on exactly this layout (ISO 11172-3 2.4.3.4.9).
+pub fn decodeSpectrum(
     gi: *const GranuleInfo,
     sr_idx: usize,
     data: []const u8,
     start: usize,
     end: usize,
     prev_sf: ?*const [22]u8,
-    out_sf: *[22]u8,
+    out_sf: *[40]u8,
     xr: *[576]f32,
-    pcm: *[576]f32,
-    overlap: *[32][18]f32,
-    synth_state: *synth.SynthState,
-    out: *[576]i16,
-    out_f32: ?*[576]f32,
+    /// Added to `global_gain`, in quarter exponents. A mid/side-only frame
+    /// passes -2 so both channels come out of requantization 3 dB low; the
+    /// mid/side sum then restores the level.
+    gain_bias: i32,
 ) Error!void {
     if (start > end or end > data.len * 8) return error.Corrupt;
 
-    out_sf.* = @splat(0);
     var br = bits.BitReader.initWindow(data, start, end);
-    const sf = readScaleFactors(gi, &br, prev_sf, out_sf);
+    readScaleFactors(gi, &br, prev_sf, out_sf);
     var exp: [576]i16 = undefined;
-    fillExponents(gi, sr_idx, &sf, &exp);
+    fillExponents(gi, sr_idx, out_sf, &exp, gain_bias);
+    try decodeHuffman(gi, sr_idx, data, br.pos, end, &exp, xr);
+}
 
-    decodeHuffman(gi, sr_idx, data, br.pos, end, &exp, xr) catch |err| return err;
-
+/// Reorder, de-alias, inverse-transform and synthesize one channel's granule.
+///
+/// Samples are written to `out[base + i * stride]`, so a stereo frame can be
+/// interleaved in place (`stride` 2, `base` 0 or 1). `out_f32`, when non-null,
+/// receives the same samples before the fixed-point conversion; the SNR tests
+/// compare it against ffmpeg's `-f f32le` output.
+pub fn renderChannel(
+    gi: *const GranuleInfo,
+    sr_idx: usize,
+    xr: *[576]f32,
+    state: *ChannelState,
+    out: []i16,
+    out_f32: ?[]f32,
+    base: usize,
+    stride: usize,
+) void {
     if (gi.block_type == 2) {
         reorder(xr, sr_idx, gi.mixed);
         if (gi.mixed) synth.aliasReduce(xr, 1);
@@ -317,24 +372,46 @@ pub fn decodeGranule(
         synth.aliasReduce(xr, 31);
     }
 
-    synth.imdctGranule(xr, gi.block_type, gi.mixed, overlap, pcm);
-
+    var pcm: [576]f32 = undefined;
+    synth.imdctGranule(xr, gi.block_type, gi.mixed, &state.overlap, &pcm);
     var samples: [576]f32 = undefined;
-    synth_state.process(pcm, &samples);
-    if (out_f32) |dst| dst.* = samples;
+    state.synth_state.process(&pcm, &samples);
     for (samples, 0..) |value, i| {
+        if (out_f32) |dst| dst[base + i * stride] = value;
         var scaled = value * 32768.0;
         if (std.math.isNan(scaled)) scaled = 0;
-        out[i] = @intFromFloat(std.math.clamp(scaled, -32768.0, 32767.0));
+        out[base + i * stride] = @intFromFloat(std.math.clamp(scaled, -32768.0, 32767.0));
     }
 }
 
 test "mono side info is exactly 136 bits" {
     var raw: [17]u8 = @splat(0);
-    raw[0] = 0;
-    raw[2] = 0; // all zero: valid zero-content granules
-    const side = try parseSideInfo(&raw);
+    const side = try parseSideInfo(&raw, 1);
     try std.testing.expectEqual(@as(u16, 0), side.main_data_begin);
+}
+
+fn setBits(bytes: []u8, start: usize, n: usize, value: u32) void {
+    for (0..n) |i| {
+        const bit: u8 = @intCast((value >> @intCast(n - 1 - i)) & 1);
+        const pos = start + i;
+        const shift: u3 = @intCast(pos % 8);
+        const mask: u8 = @as(u8, 0x80) >> shift;
+        if (bit != 0) bytes[pos / 8] |= mask else bytes[pos / 8] &= ~mask;
+    }
+}
+
+test "stereo side info is four 59-bit blocks, granule-major" {
+    var raw: [32]u8 = @splat(0);
+    // Block b starts at bit 20 (9 main_data_begin + 3 private + 8 scfsi) plus
+    // b * 59. big_values sits 12 bits in, global_gain 21 bits in.
+    setBits(&raw, 20 + 59 + 12, 9, 7); // gr0ch1 big_values
+    setBits(&raw, 20 + 118 + 21, 8, 99); // gr1ch0 global_gain
+    const side = try parseSideInfo(&raw, 2);
+    try std.testing.expectEqual(@as(u16, 0), side.granules[0][0].big_values);
+    try std.testing.expectEqual(@as(u16, 7), side.granules[0][1].big_values);
+    try std.testing.expectEqual(@as(u8, 0), side.granules[0][0].global_gain);
+    try std.testing.expectEqual(@as(u8, 99), side.granules[1][0].global_gain);
+    try std.testing.expectEqual(@as(u8, 0), side.granules[1][1].global_gain);
 }
 
 test "pair offsets end at 288 pairs" {

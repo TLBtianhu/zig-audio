@@ -1,24 +1,21 @@
-//! Streaming MPEG-1 Layer III (MP3) decoder, mono only.
+//! Streaming MPEG-1 Layer III (MP3) decoder, mono and stereo.
 //!
-//! Scope of this version: MPEG-1 (version 11), Layer III (layer 01), a single
-//! channel. MPEG-2/2.5, Layer I/II and every non-mono mode return
-//! `error.Unsupported`. ID3v2 is skipped at open, ID3v1/APE/Lyrics3 are
-//! recognized at frame boundaries.
+//! Scope of this version: MPEG-1 (version 11), Layer III (layer 01), one or two
+//! channels, including joint stereo (mid/side and intensity). MPEG-2/2.5 and
+//! Layer I/II return `error.Unsupported`. ID3v2 is skipped at open, ID3v1/APE/
+//! Lyrics3 are recognized at frame boundaries.
 //!
 //! The bit reservoir is a 511-byte history: `main_data_begin` selects how many
 //! bytes before this frame's main data the two granules start.
 
 const std = @import("std");
 const types = @import("types.zig");
-const bits = @import("mp3_bits.zig");
-const huff = @import("mp3_huffman.zig");
 const frame = @import("mp3_frame.zig");
-const synth = @import("mp3_synth.zig");
+const stereo = @import("mp3_stereo.zig");
 
 pub const Error = types.Error;
 
 const max_frame_len = 1441;
-const side_info_len = 17;
 const reservoir_len = 511;
 const main_buf_len = reservoir_len + max_frame_len;
 /// Decoder delay of the polyphase filterbank, in samples. Gapless trimming in
@@ -102,6 +99,8 @@ const Header = struct {
     bitrate: u32,
     padding: u1,
     mode: u2,
+    /// Only meaningful for joint stereo: bit 0 intensity, bit 1 mid/side.
+    mode_ext: u2,
     emphasis: u2,
     has_crc: bool,
 };
@@ -136,7 +135,7 @@ fn parseHeader(bytes: *const [4]u8) Error!Header {
     if (sr_index == 3) return error.Corrupt;
     const padding = @as(u1, @intCast((bytes[2] >> 1) & 1));
     const mode = @as(u2, @intCast((bytes[3] >> 6) & 3));
-    if (mode != 3) return error.Unsupported;
+    const mode_ext = @as(u2, @intCast((bytes[3] >> 4) & 3));
 
     const sample_rate = sample_rate_table[sr_index];
     const bitrate = bitrate_table[bitrate_index] * 1000;
@@ -149,9 +148,21 @@ fn parseHeader(bytes: *const [4]u8) Error!Header {
         .bitrate = bitrate,
         .padding = padding,
         .mode = mode,
+        .mode_ext = mode_ext,
         .emphasis = @intCast(bytes[3] & 3),
         .has_crc = has_crc,
     };
+}
+
+/// Mode 11 is mono; stereo, joint stereo and dual channel all carry two
+/// channels (ISO 11172-3 2.4.1.7).
+fn channelCount(mode: u2) u16 {
+    return if (mode == 3) 1 else 2;
+}
+
+fn stereoOptions(header: Header) stereo.Options {
+    if (header.mode != 1) return .{};
+    return .{ .intensity = header.mode_ext & 1 != 0, .ms = header.mode_ext & 2 != 0 };
 }
 
 fn syncSafe(bytes: *const [4]u8) u32 {
@@ -185,10 +196,15 @@ pub const Decoder = struct {
     history: [reservoir_len]u8 = undefined,
     history_len: usize = 0,
     main: [main_buf_len]u8 = undefined,
-    overlap: [32][18]f32 = @splat(@splat(0)),
-    synth_state: synth.SynthState = .{},
-    sf_prev: [22]u8 = @splat(0),
-    frame_samples: [1152]i16 = undefined,
+    /// Per channel: IMDCT overlap, synthesis delay line, previous long
+    /// scalefactors. Index 1 is unused for a mono stream.
+    channels: [2]frame.ChannelState = .{ .{}, .{} },
+    sf: [2][40]u8 = .{ @splat(0), @splat(0) },
+    /// One frame, frame-major interleaved: sample `f`, channel `c` is
+    /// `frame_samples[f * out_channels + c]`.
+    frame_samples: [2 * 1152]i16 = undefined,
+    out_channels: usize = 1,
+    stereo_opts: stereo.Options = .{},
     /// Test support: when non-null, every decoded granule's f32 PCM (before the
     /// i16 conversion) is appended here. The public API stays i16-only.
     float_sink: ?*std.ArrayList(f32) = null,
@@ -206,8 +222,16 @@ pub const Decoder = struct {
         if (self.pending_error) |err| return err;
         if (self.done) return 0;
 
+        // `out` is frame-major, like every other decoder in this library: a
+        // buffer that cannot hold one whole frame is a named error, and a
+        // partial frame is never returned.
+        const channels: usize = self.out_channels;
+        const capacity_frames = out.len / channels;
+        if (capacity_frames == 0) return error.ShortBuffer;
+        const capacity = capacity_frames * channels;
+
         var written: usize = 0;
-        while (written < out.len) {
+        while (written < capacity) {
             if (self.frame_sample_pos == self.frame_sample_count) {
                 const more = self.nextAudio() catch |err| {
                     self.pending_error = err;
@@ -226,7 +250,7 @@ pub const Decoder = struct {
                 if (available == 0) continue;
             }
 
-            var take = @min(available, out.len - written);
+            var take = @min(available, capacity - written);
             if (self.deliver_remaining) |remaining| {
                 if (remaining == 0) {
                     self.done = true;
@@ -287,26 +311,33 @@ pub const Decoder = struct {
         if (!self.have_header) {
             self.header = raw.header;
             self.have_header = true;
+            self.out_channels = channelCount(raw.header.mode);
             self.info = .{
                 .format = .mp3,
                 .sample_rate = raw.header.sample_rate,
-                .channels = 1,
+                .channels = @intCast(self.out_channels),
                 .bits_per_sample = 16,
                 .total_frames = null,
             };
-        } else if (raw.header.sample_rate != self.header.sample_rate) {
+        } else if (raw.header.sample_rate != self.header.sample_rate or
+            channelCount(raw.header.mode) != self.out_channels)
+        {
             return error.Corrupt;
         }
+        // Joint stereo flags are per frame: an encoder is free to switch
+        // mid/side off on some frames and on for others (LAME does exactly
+        // that), so this cannot be cached from the first frame.
+        self.stereo_opts = stereoOptions(raw.header);
         self.frames_loaded += 1;
         self.frame_len = raw.header.frame_len;
         self.side_off = 4 + (if (raw.header.has_crc) @as(usize, 2) else 0);
-        self.main_off = self.side_off + side_info_len;
+        self.main_off = self.side_off + if (self.out_channels == 2) @as(usize, 32) else 17;
         if (self.frame_len < self.main_off) return error.Corrupt;
 
         @memcpy(self.frame_buf[0..4], &raw.bytes);
         if (!try self.source.readExact(self.frame_buf[4..self.frame_len])) return error.Truncated;
 
-        self.side = try frame.parseSideInfo(self.frame_buf[self.side_off..][0..side_info_len]);
+        self.side = try frame.parseSideInfo(self.frame_buf[self.side_off..][0..(self.main_off - self.side_off)], self.out_channels);
         self.is_meta = false;
         if (self.frames_loaded == 1 and self.frame_len >= self.main_off + 4) {
             const magic = self.frame_buf[self.main_off..][0..4];
@@ -359,16 +390,17 @@ pub const Decoder = struct {
             if (count != 0) {
                 self.audio_frames_remaining = count;
                 const total = @as(u64, count) * 1152;
+                const ch: u64 = self.out_channels;
                 if (have_lame) {
                     const trim = @as(u64, delay) + padding;
                     if (total > trim) {
                         self.info.total_frames = total - trim;
-                        self.deliver_remaining = total - trim;
+                        self.deliver_remaining = (total - trim) * ch;
                     }
-                    self.skip_remaining = @as(u64, delay) + decoder_delay;
+                    self.skip_remaining = (@as(u64, delay) + decoder_delay) * ch;
                 } else {
                     self.info.total_frames = total;
-                    self.deliver_remaining = total;
+                    self.deliver_remaining = total * ch;
                 }
             }
         }
@@ -377,6 +409,7 @@ pub const Decoder = struct {
 
     fn decodeLoadedFrame(self: *Decoder) Error!void {
         if (self.frame_len <= self.main_off) return error.Corrupt;
+        const nch = self.out_channels;
         const mdb: usize = self.side.main_data_begin;
         if (mdb > self.history_len) return error.Corrupt;
         const main_bytes = self.frame_len - self.main_off;
@@ -386,60 +419,74 @@ pub const Decoder = struct {
         if (mdb > 0) @memcpy(self.main[0..mdb], self.history[self.history_len - mdb .. self.history_len]);
         @memcpy(self.main[mdb..][0..main_bytes], self.frame_buf[self.main_off..self.frame_len]);
 
-        var xr: [576]f32 = undefined;
-        var pcm: [576]f32 = undefined;
-        var granule_f32: [576]f32 = undefined;
-        const capture: ?*[576]f32 = if (self.float_sink != null) &granule_f32 else null;
-        var start: usize = 0;
+        // Spectral lines stay in the Huffman layout until joint stereo has run;
+        // only then is each channel reordered, de-aliased and transformed.
+        // A mid/side-only frame requantizes 2 quarter-steps low on both
+        // channels; the mid/side sum restores the level (ISO 11172-3's
+        // 1/sqrt(2) normalization, folded into the gain instead of the spectra).
+        const ms_only = self.stereo_opts.ms and !self.stereo_opts.intensity;
+        const gain_bias: i32 = if (ms_only) -2 else 0;
+        var xr: [2][576]f32 = undefined;
+        var granule_f32: [2 * 576]f32 = undefined;
+        var bit: usize = 0;
         for (0..2) |g| {
-            const info = &self.side.granules[g];
-            const end = start + info.part2_3_length;
-            if (end > payload * 8) return error.Corrupt;
-            var dummy: [22]u8 = undefined;
-            if (g == 0) {
-                try frame.decodeGranule(
+            for (0..nch) |ch| {
+                const info = &self.side.granules[g][ch];
+                const end = bit + info.part2_3_length;
+                if (end > payload * 8) return error.Corrupt;
+                // `self.sf[ch]` is both the output and the scfsi history: a
+                // reused scalefactor group reads back granule 0's value.
+                try frame.decodeSpectrum(
                     info,
                     self.header.sr_idx,
                     self.main[0..payload],
-                    start,
+                    bit,
                     end,
-                    null,
-                    &self.sf_prev,
-                    &xr,
-                    &pcm,
-                    &self.overlap,
-                    &self.synth_state,
-                    self.frame_samples[0..576],
-                    capture,
+                    if (g == 1) self.sf[ch][0..22] else null,
+                    &self.sf[ch],
+                    &xr[ch],
+                    gain_bias,
                 );
-            } else {
-                try frame.decodeGranule(
-                    info,
+                bit = end;
+            }
+
+            if (nch == 2) {
+                stereo.process(
+                    &xr[0],
+                    &xr[1],
                     self.header.sr_idx,
-                    self.main[0..payload],
-                    start,
-                    end,
-                    &self.sf_prev,
-                    &dummy,
-                    &xr,
-                    &pcm,
-                    &self.overlap,
-                    &self.synth_state,
-                    self.frame_samples[576..1152],
+                    &self.side.granules[g][1],
+                    &self.sf[1],
+                    self.stereo_opts,
+                );
+            }
+
+            for (0..nch) |ch| {
+                const capture: ?[]f32 = if (self.float_sink != null)
+                    granule_f32[0 .. 576 * nch]
+                else
+                    null;
+                frame.renderChannel(
+                    &self.side.granules[g][ch],
+                    self.header.sr_idx,
+                    &xr[ch],
+                    &self.channels[ch],
+                    self.frame_samples[g * 576 * nch ..][0 .. 576 * nch],
                     capture,
+                    ch,
+                    nch,
                 );
             }
             if (self.float_sink) |sink| {
-                try sink.appendSlice(self.float_sink_gpa, &granule_f32);
+                try sink.appendSlice(self.float_sink_gpa, granule_f32[0 .. 576 * nch]);
             }
-            start = end;
         }
 
         const keep = @min(payload, reservoir_len);
         @memcpy(self.history[0..keep], self.main[payload - keep .. payload]);
         self.history_len = keep;
         self.frame_sample_pos = 0;
-        self.frame_sample_count = 1152;
+        self.frame_sample_count = 1152 * nch;
         if (self.audio_frames_remaining) |*remaining| {
             if (remaining.* > 0) remaining.* -= 1;
         }

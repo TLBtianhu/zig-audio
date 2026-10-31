@@ -1,10 +1,11 @@
 # Test fixtures
 
 Generated locally with **ffmpeg n7.1.5** (20260731 build). They are committed
-because they are tiny (about 90 KB total, still under the 100 KB budget) and let
-CI exercise real encoder output without installing ffmpeg.
+because they are tiny (about 110 KB total) and let CI exercise real encoder
+output without installing ffmpeg.
 
-No third-party or copyrighted content: every file is a 0.02 s, 440 Hz sine wave.
+No third-party or copyrighted content: every WAV/FLAC file is a 0.02 s, 440 Hz
+sine wave; the two MP3 files are synthetic tones described below.
 
 ## Commands
 
@@ -70,6 +71,25 @@ corpus is not committed. Those cases are therefore built in memory by
 `src/flac_build.zig` and compared against ffmpeg's own decoder in
 `src/flac_lpc_test.zig` and the other `src/*_test.zig` files.
 
+## MP3 fixtures
+
+Both are MPEG-1 Layer III, 44.1 kHz, 128 kbps, encoded with `libmp3lame` from
+ffmpeg's `sine` / `aevalsrc` sources, and are used by `zig build bench` (one
+decodes the whole file repeatedly for 20 s of audio):
+
+```sh
+ffmpeg -v error -y -f lavfi -i "sine=frequency=440:duration=3" \
+  -ac 1 -ar 44100 -c:a libmp3lame -b:a 128k mp3-mono-44k-128.mp3
+ffmpeg -v error -y -f lavfi \
+  -i "aevalsrc=sin(2*PI*440*t)|sin(2*PI*660*t):s=44100:d=1" \
+  -ac 2 -ar 44100 -c:a libmp3lame -b:a 128k mp3-stereo-44k-128.mp3
+```
+
+| File | Channels | Frames | Purpose |
+| --- | --- | --- | --- |
+| `mp3-mono-44k-128.mp3` | 1 | 132300 | mono throughput (3 s) |
+| `mp3-stereo-44k-128.mp3` | 2 | 44100 | stereo throughput: two synthesis chains (1 s) |
+
 ## What each fixture covers
 
 - WAV: unsigned PCM8, PCM16, PCM24, PCM32, IEEE float32, and 5.1
@@ -78,6 +98,9 @@ corpus is not committed. Those cases are therefore built in memory by
   and 44.1 kHz stereo with order-32 mid/side prediction). The 16/24-bit files
   and the stereo LPC file decode to exactly the same i16 samples as their WAV
   sources, which is checked on every CI run.
+- MP3: one mono and one stereo tone, for the benchmark only. The MP3 conformance
+  corpus lives outside the repository (`..\zig-audio-vectors\mp3`) and the
+  intensity-stereo cases are built in memory by `src/mp3_build.zig`.
 
 The live ffmpeg integration tests in `src/ffmpeg_test.zig` generate equivalent
 files through a pipe, where ffmpeg writes WAV `data` size `0xFFFFFFFF` and FLAC
