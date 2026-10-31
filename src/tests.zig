@@ -15,6 +15,7 @@ test {
     _ = @import("aiff_test.zig");
     _ = @import("legacy_vectors_test.zig");
     _ = @import("ogg_test.zig");
+    _ = @import("vorbis_meta_test.zig");
     _ = @import("vorbis_test.zig");
     _ = @import("vorbis_huffman_test.zig");
     _ = @import("vorbis_floor_test.zig");
