@@ -25,12 +25,18 @@ const flac_lpc_fixture = @embedFile("fixtures/flac-s16-stereo-44100-lpc.flac");
 const flac_seconds: f64 = 20.0;
 const flac_target_speedup: f64 = 100.0;
 
+/// 3 s of a 440 Hz sine, mono MPEG-1 Layer III at 128 kbps.
+const mp3_fixture = @embedFile("fixtures/mp3-mono-44k-128.mp3");
+const mp3_seconds: f64 = 20.0;
+const mp3_target_speedup: f64 = 100.0;
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     try benchWav(allocator, io);
     try benchFlac(allocator, io, "FLAC fixed", flac_fixture);
     try benchFlac(allocator, io, "FLAC LPC", flac_lpc_fixture);
+    try benchMp3(allocator, io);
 }
 
 fn benchWav(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -75,6 +81,33 @@ fn benchWav(allocator: std.mem.Allocator, io: std.Io) !void {
         wav_target_speedup,
         null,
     );
+}
+
+fn benchMp3(allocator: std.mem.Allocator, io: std.Io) !void {
+    var pcm: [8192]i16 = undefined;
+    var decoded_frames: u64 = 0;
+    var files: usize = 0;
+    var checksum: i64 = 0;
+
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    while (@as(f64, @floatFromInt(decoded_frames)) / 44_100 < mp3_seconds) : (files += 1) {
+        var reader = std.Io.Reader.fixed(mp3_fixture);
+        var dec = try root.open(allocator, &reader);
+        defer dec.deinit();
+        if (dec.info.total_frames != 132_300) return error.UnexpectedFrameCount;
+        while (true) {
+            const n = try dec.read(&pcm);
+            if (n == 0) break;
+            decoded_frames += n;
+            for (pcm[0..n]) |sample| checksum +%= sample;
+        }
+    }
+    const elapsed = started.untilNow(io);
+    std.mem.doNotOptimizeAway(checksum);
+    std.mem.doNotOptimizeAway(files);
+    const elapsed_ns: f64 = @floatFromInt(elapsed.raw.nanoseconds);
+    if (elapsed_ns <= 0) return error.TimerResolutionTooLow;
+    try report("MP3 128k mono", elapsed_ns, @floatFromInt(decoded_frames), 44_100, 1, mp3_target_speedup, files);
 }
 
 fn benchFlac(

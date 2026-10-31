@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）目前支持**单声道**：四个测试向量（32/44.1/48 kHz，CBR 与 VBR）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 1e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换，见下文。
 
 ## FLAC：完整支持
 
@@ -30,6 +30,26 @@
 2. 位深转换、FIXED 0–4 阶、LPC 1–32 阶、qlp precision 1/2/15、负 shift、32 位以上预测和、Rice 分区、escape code、wasted bits 与三种去相关声道由 `src/flac_build.zig` 构造的合成流覆盖（`src/flac_lpc_test.zig`），并与 ffmpeg 的解码结果对齐。
 
 `61 - predictor overflow check` 的预测值达到 860128（远超 16 位样本范围），而累加和最大约 8.8×10⁸；它检验的是"预测值不能按 bps 截断"，不是 32 位累加和溢出。真正超过 32 位的累加和由合成用例覆盖：`Σ = 32 × 16383 × 32767 = 17178296352`（约为 2³⁴、i32 上限的 8 倍），i32 回绕会预测出 −48 而不是 524240。
+
+## MP3：MPEG-1 Layer III 单声道（实验中）
+
+已实现：帧同步与头解析、ID3v2/ID3v1/APE/Lyrics3 跳过、Xing/Info + LAME delay/padding、
+MPEG-1 单声道 side info、跨帧 bit reservoir、ISO Table B.7 的 32 张 Huffman 表（表 0–31，
+含 linbits 与 count1 A/B）、scalefactors、反量化、short block 重排、抗混叠、18/12 点 IMDCT、
+频率反转、32 子带多相合成，以及 gapless 裁剪（delay + 529 样点滤波器延迟）。
+
+| 能力 | 状态 |
+| --- | --- |
+| MPEG-1 Layer III / 单声道 | ✅ |
+| MPEG-2/2.5、Layer I/II、立体声/联合立体声 | `error.Unsupported` |
+| 长块（normal） | 四个向量逐 granule 与 ffmpeg 相差 < 1e-6（f32），s16 最大 1 LSB |
+| short/start/stop 窗口 | 同上；1 秒静音 + 10 ms 脉冲的 start→short→short→stop 回归测试 SNR 121.6 dB |
+
+验收判据（见 `src/mp3_vectors_test.zig`）：f32 与 ffmpeg 比 SNR ≥ 90 dB、逐 granule 最大差 < 1e-4；
+s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SNR 不得塌陷；样本总数与 ffmpeg 完全一致。
+s16 的上限来自两边不同的 i16 舍入规则（满幅时约 0.5 LSB ≈ 72 dB），所以两条判据不同。
+
+`zig build bench` 的 MP3 行用 3 秒 44.1 kHz/128 kbps 单声道文件，ReleaseFast 下约 800x 实时。
 
 ## 这不是 Zig 版 FFmpeg
 
@@ -88,9 +108,9 @@ pub fn main() !void {
 只想知道格式、不想消费流：
 
 ```zig
-// header 至少 4 字节（FLAC）或 12 字节（WAV）；函数不会读 reader，也不会修改切片。
+// header 至少 4 字节（FLAC/MP3 sync）或 12 字节（WAV）；函数不会读 reader，也不会修改切片。
 if (audio.probe(header)) |format| {
-    // format == .wav 或 .flac
+    // format == .wav、.flac 或 .mp3
 }
 ```
 
