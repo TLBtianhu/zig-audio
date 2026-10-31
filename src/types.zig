@@ -3,7 +3,15 @@
 //! These live in a separate file so `wav.zig` and the FLAC implementation can
 //! use them without importing the public root (which imports them back).
 
-pub const Format = enum { wav, flac, mp3, aiff };
+pub const Format = enum {
+    wav,
+    flac,
+    mp3,
+    aiff,
+    /// Ogg container carrying a Vorbis stream. Header parsing only in this
+    /// version; the public `open` reports `Unsupported` after parsing them.
+    ogg_vorbis,
+};
 
 pub const Info = struct {
     format: Format,

@@ -14,6 +14,9 @@ test {
     _ = @import("adpcm_test.zig");
     _ = @import("aiff_test.zig");
     _ = @import("legacy_vectors_test.zig");
+    _ = @import("ogg_test.zig");
+    _ = @import("vorbis_test.zig");
+    _ = @import("ogg_vectors_test.zig");
     _ = @import("ffmpeg_test.zig");
     _ = @import("fuzz.zig");
 }

@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg 本轮只做容器 + Vorbis 头解析（码本 / floor / residue / mapping / mode），PCM 下一轮；Opus 未支持。**
 
 ## FLAC：完整支持
 
@@ -66,6 +66,39 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 `zig build bench` 的 MP3 行有两条：3 秒 44.1 kHz/128 kbps 单声道文件约 900x 实时，
 1 秒 44.1 kHz/128 kbps 立体声文件约 570x 实时（ReleaseFast，两者都远高于 100x 目标）。
 
+## Ogg 容器 + Vorbis 头（PCM 下一轮）
+
+这一轮只做 **Ogg 容器 + Vorbis 三个头包**，不产出 PCM：`probe` 能认出 Ogg/Vorbis，`open` 把 identification、comment、setup **全部解析完**（码本、floor、residue、mapping、mode），然后返回 `error.Unsupported`，等下一轮接上 floor 曲线与 MDCT 合成。先把头跑通而不是先写半个解码器，是为了让 fuzz 与结构测试立刻覆盖容器和 setup 位流，同时不会给出错误音频。
+
+| 能力 | 状态 | 说明 |
+| --- | --- | --- |
+| 页面解析（`OggS`、版本、header type、granule、serial、sequence、segment table） | ✅ | 多字节字段小端；保留位非零 → `error.Corrupt` |
+| CRC-32（多项式 `0x04C11DB7`，MSB-first，init 0，无 final xor） | ✅ | **每一页都校验**，包括被跳过的逻辑流页面；翻一个页体字节 → `error.Corrupt` |
+| packet 拼装（一个 packet 可跨页，255 lacing 续页） | ✅ | 4 MiB 工程上限；悬空 continuation → `error.Truncated` |
+| 多逻辑流 | ✅ | 只取**第一个**音频流（按 `\x01vorbis` / `OpusHead` 识别），其余页读过并丢弃；chained 流也忽略 |
+| EOS / 页序号 | ✅ | EOS 结束（其后页不再读）；目标流页序号跳号 → `error.Corrupt` |
+| Vorbis identification / comment | ✅ | 版本、声道、采样率、bitrate 上限/标称/下限、块大小 `2^n`；comment 的 vendor 与条目跳过 |
+| Vorbis setup：码本 | ✅ | ordered / unordered / sparse 三种长度表；lookup type 0/1/2；type 1 的 VQ 表只有 `lookup_values` 个标量，`Codebook.latticeIndex()` 记录 lattice 下标公式 |
+| floor 0 / 1 | ✅ | floor1 校验 X 列表 ≤ 65 且互不重复；子类 book 按 `read8 - 1` 存储，读到 0 表示该子类不用 book |
+| residue 0 / 1 / 2 | ✅ | **先读完所有 cascade，再按 classification 读 book 列表**（不是交错）；classbook / book 越界 → `error.Corrupt` |
+| mapping / mode | ✅ | mapping type 0、耦合步（magnitude ≠ angle）、submap mux、每 submap 的 time/floor/residue；mode 的 window/transform 必须为 0 |
+| `Info.total_frames` | ✅ | 扫描到最后一个 granule（Vorbis 的 PCM 帧数）；没有任何 granule 页时 `null` |
+| PCM 解码 | ⏳ 下一轮 | `open` 返回 `error.Unsupported`，但三份头已经解析完，fuzz/测试现在就在覆盖它们 |
+| Opus | ❌ **未支持** | `probe` 返回 `null`（绝不谎报 Vorbis），`open` 明确返回 `error.Unsupported`，不会崩 |
+
+**位序与 FLAC/MP3 相反**：Vorbis 的位打包是 **LSB-first**（多比特字段的**第一个**读到的位是**最低**位），FLAC/MP3 是 MSB-first。所以 `src/vorbis_bits.zig` 是独立读取器，不复用 `flac_bits.BitReader`。测试里对同一个字节 `0xB5` 做了对照：Vorbis 先读 4 位得到 `0x5`，FLAC/MSB 读取器得到 `0xB`。如果“顺手复用”MSB 读取器，setup 里每个字段都会静默反序。
+
+**验收素材**（在仓库外的 `..\zig-audio-vectors\ogg`，不进 git；缺失时打印一行并 `SkipZigTest`）：
+
+| 素材 | 编码 | 声道 | 采样率 | 块大小 | 码本 | floor | residue | mode | total_frames |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `vorbis-44k-q4.ogg` | Vorbis q4 | 2 | 44100 | 256 / 2048 | 42 | 1, 1 | 2, 2 | 2 | 132300 |
+| `vorbis-48k-noise.ogg` | Vorbis q6 | 2 | 48000 | 256 / 2048 | 44 | 1, 1 | 2, 2 | 2 | 96000 |
+| `opus-48k-96.opus` | Opus 96k | — | — | — | — | — | — | — | `probe` null / `open` `Unsupported` |
+| `opus-48k-mono.opus` | Opus 64k | — | — | — | — | — | — | — | 同上 |
+
+ffprobe 只暴露声道、采样率和时长（这个时长正好对上 `total_frames`）；码本 / floor / residue / mode 的数量用一个独立的 Python 参考解析器按 Vorbis I 规范交叉核对，两边逐项一致。坏 CRC（页体翻一字节）→ `error.Corrupt`；截断（页体切 5 字节）→ `error.Truncated`。
+
 ## 老格式与 Mac 来源：G.711 / ADPCM / AIFF
 
 这一组格式的共同点是**整数运算、可逐样本校验**。六个 2 秒素材对 ffmpeg `-f s16le` 的 `max_diff` 全部为 0，样本总数完全一致：
@@ -116,7 +149,7 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 
 - `src/g711_test.zig` / `src/adpcm_test.zig` / `src/aiff_test.zig`：表地标与全表对称性、手算块（含 IMA 饱和、MS 截断除法与立体声交错）、AIFF 各位深与 80 位浮点边界、具名拒绝；
 - `src/legacy_vectors_test.zig`：六个真文件的 `probe`/`Info`/`total_frames` 与 `max_diff 0` 验收（文件缺失时打印一行并 `SkipZigTest`）；
-- 变异 fuzz 模板从 4 个扩到 10 个（六种新素材全部在列），`zig build fuzz` 10000 轮无 panic；
+- 变异 fuzz 模板从 4 个扩到 11 个（六种老格式素材与 Ogg/Vorbis 全部在列），`zig build fuzz` 10000 轮无 panic；
 - bench 新增 4 行：µ-law 8 kHz、IMA/MS ADPCM 44.1 kHz、AIFF PCM16 44.1 kHz，ReleaseFast 下均远高于 100x 目标（本机约 6.6k–400k× 实时）。
 
 ## 这不是 Zig 版 FFmpeg
@@ -130,7 +163,7 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 | 视频/图像解码 | 视频在 Windows / macOS / Linux 上都有系统解码器（Media Foundation + D3D11VA、VideoToolbox、VA-API），硬解、色彩管理和帧调度是平台强项；重写一遍只会更慢、更脆。 |
 | 音频编码 / 转码 | 编码要码率控制、心理声学模型和大量格式组合，是另一条产品线；解码器的价值恰恰在于把这件事排除在外。 |
 | 滤镜、重采样、混音图 | 这些是 DSP 策略，应该由调用方或专门的 DSP 库决定；解码器只负责把字节变成采样，不替调用方改变声音。 |
-| 容器多路复用 / 解复用（MP4、MKV 的轨道、时间轴、编辑列表） | 本库只读**单个音频流的负载**。容器是另一个抽象层，混进来会把“可 fuzz 的小解析器”变成“半个播放器”。 |
+| 容器多路复用 / 解复用（MP4、MKV 的轨道、时间轴、编辑列表） | 本库只读**单个音频流的负载**，不选轨道、不建时间轴。唯一的例外是 Ogg：Vorbis 自身没有 framing，页、CRC 和 packet 边界只能由 Ogg 提供，所以 `src/ogg.zig` 只解析“第一个音频流”的页并校验 CRC，不做轨道选择，也没有编辑列表。MP4/MKV 仍在界外。 |
 | 网络协议（HTTP、HLS、DASH、RTSP） | 网络、重试、缓存、鉴权都由调用方处理；库只接受一个 `std.Io.Reader`，不碰 socket，也不做请求。 |
 | CLI / ffmpeg 命令行参数兼容 | 这不是命令行工具。目标 API 是 Zig 函数调用；模仿 `ffmpeg -i ... -af ...` 的参数方言与库的边界无关。 |
 
@@ -142,7 +175,7 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 
 音频不一样：Windows 上 WASAPI 只负责**输出**，系统并不带 FLAC / Opus 解码器；macOS 的 AudioToolbox 对 FLAC 的支持也随版本和容器而变。一个应用如果想“走到哪都能放 FLAC”，最后往往还是得自带解码器。音频格式的专利面也窄得多（FLAC、Opus 都是开放、免专利的），维护成本比视频低一个数量级。
 
-所以这里只做音频：**WAV 已完整（含 G.711 与两种 ADPCM），AIFF PCM 已支持，FLAC 子帧集合已完整**（官方 13 个向量全部整文件逐样本对齐），Opus 等后续再评估。
+所以这里只做音频：**WAV 已完整（含 G.711 与两种 ADPCM），AIFF PCM 已支持，FLAC 子帧集合已完整**（官方 13 个向量全部整文件逐样本对齐），**Ogg 容器与 Vorbis 头已解析**（PCM 下一轮）。Opus 未支持，评估后再定。
 
 ## 用法
 
@@ -176,9 +209,10 @@ pub fn main() !void {
 只想知道格式、不想消费流：
 
 ```zig
-// header 至少 4 字节（FLAC/MP3 sync）或 12 字节（WAV）；函数不会读 reader，也不会修改切片。
+// header 至少 4 字节（FLAC/MP3 sync）或 12 字节（WAV）；Ogg 需要 36 字节才能看到首包魔数。
+// 函数不读 reader，也不修改切片。
 if (audio.probe(header)) |format| {
-    // format == .wav、.flac 或 .mp3
+    // format == .wav、.flac、.mp3、.aiff 或 .ogg_vorbis
 }
 ```
 
@@ -384,6 +418,8 @@ while (true) {
 | `fLaC` | `.flac` | 尝试按 FLAC 打开（支持 CONSTANT / VERBATIM / FIXED / LPC + 三种去相关） |
 | `FORM` … `AIFF` | `.aiff` | 尝试按 AIFF 打开（大端 PCM 8/16/24/32） |
 | `FORM` … `AIFC` | `null` | `error.Unsupported` |
+| `OggS` + 首包 `\x01vorbis`（需要 ≥ 36 字节才能看到首包魔数） | `.ogg_vorbis` | 解析 Ogg + Vorbis 头后 `error.Unsupported`（PCM 下一轮） |
+| `OggS` + `OpusHead`，或其它/未知逻辑流 | `null` | `error.Unsupported` |
 | `RF64` / `RIFX` + `WAVE` | `null` | `error.Unsupported` |
 | 其他 | `null` | `error.NotAudio` |
 
@@ -392,7 +428,7 @@ while (true) {
 ## 公共 API
 
 ```zig
-pub const Format = enum { wav, flac, mp3, aiff };
+pub const Format = enum { wav, flac, mp3, aiff, ogg_vorbis };
 
 pub const Info = struct {
     format: Format,
@@ -445,7 +481,7 @@ pub const Decoder = struct {
 - **声道原样保留**：不做下混、不做上混、不做采样率转换。5.1 就是 6 声道。
 - **reader / 文件生命周期**：`open` 的 `reader` 由调用方持有；`openBytes` 的 `bytes` 不被复制；`openFile*` 的 `file` 不被关闭。三者都必须比 `Decoder` 活得久，`deinit()` 只释放 decoder 自己分配的东西。
 - **错误后不复用**：`read()` 返回任何错误后，这个 decoder 的状态不再保证，直接 `deinit()`；不要用“再读一次”来探测错误是否消失。
-- **入口会消费流**：`open()` 读取 12 字节签名并扫描元数据/chunk，直到首个音频帧（WAV 是 `data` 负载，FLAC 是第一帧）起点；`openFile*` 用 positional reader 从 offset 0 开始；失败时也可能已经消费了最多 12 字节（甚至更多头部）。想先判断而不消费，用 `probe()`（需要调用方自己准备那几字节）。
+- **入口会消费流**：`open()` 读取 12 字节签名并扫描元数据/chunk，直到首个音频帧（WAV 是 `data` 负载，FLAC 是第一帧）起点；`openFile*` 用 positional reader 从 offset 0 开始；失败时也可能已经消费了最多 12 字节（甚至更多头部）。Ogg 这一轮为了从最后一页的 granule 得到 `total_frames`，`open()` 会读完整段流再返回 `error.Unsupported`。想先判断而不消费，用 `probe()`（需要调用方自己准备那几字节；Ogg 要 36 字节）。
 - **错误不吞**：截断、损坏、不支持、I/O 失败分别有具名错误；不使用 `catch {}` 把问题变成静音。
 
 ### PCM 输出规则（逐比特可复现）
@@ -495,7 +531,7 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 - **解码器无全局状态**：没有单例、没有线程局部缓存、没有全局注册表；两个 decoder 可以并发解不同的流。唯一的例外是 `openFile()` 这个不带 `Io` 的便利入口——它必须从某处拿到 `Io`，使用的是 std 的 `Threaded.global_single_threaded`（单线程、阻塞）。需要并发、取消或自定义事件循环时，用 `openFileWithIo()` 或 `open()`。
 - **无分配（或显式 allocator）**：WAV 的 PCM / float / G.711 路径零分配；WAV 的 ADPCM 在 `open*()` 用调用方的 allocator 分配**一个压缩块 + 一个解码块**；FLAC 在 `open*()` 分配**一帧**的 i32 缓冲；`read()` 永远不分配；`deinit()` 释放。
 - **显式错误**：`NotAudio` / `Unsupported` / `Truncated` / `Corrupt` / `Io` / `OutOfMemory` / `ShortBuffer`；没有“静音代替错误”。
-- **可 fuzz**：解析器只接受 `[]const u8` 和 `std.Io.Reader`，没有文件系统、线程、时间依赖；`zig build fuzz` 对 10 种合法模板（WAV / FLAC / MP3 mono / MP3 stereo / µ-law / A-law / IMA ADPCM / MS ADPCM / AIFF16 / AIFF24）做随机变异，断言不 panic、不越界、错误具名。
+- **可 fuzz**：解析器只接受 `[]const u8` 和 `std.Io.Reader`，没有文件系统、线程、时间依赖；`zig build fuzz` 对 11 种合法模板（WAV / FLAC / MP3 mono / MP3 stereo / µ-law / A-law / IMA ADPCM / MS ADPCM / AIFF16 / AIFF24 / Ogg-Vorbis）做随机变异，断言不 panic、不越界、错误具名。
 
 ## 构建与测试
 
@@ -503,8 +539,8 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 
 ```sh
 zig build            # 编译库（static lib 到 zig-out/）
-zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz（10 种模板）
-zig build fuzz       # 10000 轮变异 fuzz（WAV / FLAC / MP3 / G.711 / ADPCM / AIFF 共 10 种模板）
+zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz（11 种模板）
+zig build fuzz       # 10000 轮变异 fuzz（WAV / FLAC / MP3 / G.711 / ADPCM / AIFF / Ogg-Vorbis 共 11 种模板）
 zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）、MP3 与老格式解码基准（ReleaseFast；低于目标会失败）
 ```
 
@@ -531,6 +567,11 @@ src/flac_bits.zig   MSB 位读取 + CRC-8 / CRC-16
 src/flac_meta.zig   STREAMINFO 与元数据块循环
 src/flac_frame.zig  帧头、子帧、Rice 分区、帧尾 CRC
 src/flac_build.zig  测试专用 FLAC 编码器（不进库）
+src/ogg.zig         Ogg 页、CRC-32、packet 拼装、首音频流选择
+src/vorbis.zig      Vorbis identification / comment / setup（floor、residue、mapping、mode）
+src/vorbis_bits.zig LSB-first 位读取 + ilog / lookup1_values
+src/vorbis_codebook.zig  码本长度表与 VQ lookup（含 type 1 lattice）
+src/ogg_build.zig / vorbis_build.zig  测试专用 Ogg 页 / Vorbis 头写入器（不进库）
 src/bench.zig       WAV + FLAC + MP3 + 老格式基准程序
 src/fuzz.zig        变异 fuzzer（同时作为 1000 轮测试运行）
 src/compare.zig     与 ffmpeg 逐样本比较的测试辅助
