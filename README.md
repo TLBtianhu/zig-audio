@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg Vorbis 完整解码**：容器、三个头包、floor 1 / residue 0-1-2 / 逆耦合 / IMDCT / 重叠相加，两个测试向量整文件对 ffmpeg 的 f32 输出 SNR 131.9–133.4 dB（最大差 < 8e-8）、s16 SNR 98.8–101.0 dB（最大 1 LSB），样本数与 granule 完全一致；floor 0 与 **Opus 未支持**。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg Vorbis 完整解码**：容器、三个头包、floor 1 / residue 0-1-2 / 逆耦合 / IMDCT / 重叠相加，两个测试向量整文件对 ffmpeg 的 f32 输出 SNR 131.9–133.4 dB（最大差 < 8e-8）、s16 SNR 98.8–101.0 dB（最大 1 LSB），样本数与 granule 完全一致。**Ogg Opus 本轮只做容器与包结构**：`OpusHead` / `OpusTags` / 每个包的 TOC 帧结构 / 时长（granule − pre-skip）全部可读，五个测试向量与 ffprobe 对齐；**解码未实现**，`open` 明确返回 `error.Unsupported`，不伪造静音。floor 0 与 Opus 解码未支持。
 
 ## FLAC：完整支持
 
@@ -68,7 +68,7 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 
 ## Ogg Vorbis：完整解码
 
-Ogg 容器 + Vorbis I **整条解码链**：三个头包、audio packet、floor 曲线、residue（format 0/1/2）、逆耦合、IMDCT、重叠相加。`open` 返回可读 PCM 的 `Decoder`，Opus 仍然明确未支持。
+Ogg 容器 + Vorbis I **整条解码链**：三个头包、audio packet、floor 曲线、residue（format 0/1/2）、逆耦合、IMDCT、重叠相加。`open` 返回可读 PCM 的 `Decoder`。Opus 共用同一套容器层，但本轮只做到**包结构**为止，见下面「Ogg Opus：容器已支持、解码未实现」。
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
@@ -87,7 +87,7 @@ Ogg 容器 + Vorbis I **整条解码链**：三个头包、audio packet、floor 
 | IMDCT | ✅ | DCT-IV 经两个 M 点复数 FFT；**无归一化因子**（见下） |
 | 重叠相加 | ✅ | 每块输出 `(前块 + 本块)/4` 个样本；首块只用于“预热”，不输出 |
 | `Info.total_frames` | ✅ | 流的最后一个 granule；因为要读到末页才知道，`open` 时是 `null`，`read` 到 EOF 后填上 |
-| Opus | ❌ **未支持** | `probe` 返回 `null`（绝不谎报 Vorbis），`open` 明确返回 `error.Unsupported`，不会崩 |
+| Opus | ⚠️ 容器/包结构 ✅，解码 ❌ | `probe` 现在返回 `.ogg_opus`；`opus.inspect` 解析 `OpusHead` / `OpusTags` / 每个包的 TOC 与时长。`open` 仍 `error.Unsupported`（没有解码器，也不伪造静音），见下面「Ogg Opus」一节 |
 
 **验收素材**（在仓库外的 `..\zig-audio-vectors\ogg`，不进 git；缺失时打印一行并 `SkipZigTest`）：
 
@@ -95,8 +95,8 @@ Ogg 容器 + Vorbis I **整条解码链**：三个头包、audio packet、floor 
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `vorbis-44k-q4.ogg` | Vorbis q4 | 2 | 44100 | 256 / 2048 | 42 | 1, 1 | 2, 2 | 2 | 132300 |
 | `vorbis-48k-noise.ogg` | Vorbis q6 | 2 | 48000 | 256 / 2048 | 44 | 1, 1 | 2, 2 | 2 | 96000 |
-| `opus-48k-96.opus` | Opus 96k | — | — | — | — | — | — | — | `probe` null / `open` `Unsupported` |
-| `opus-48k-mono.opus` | Opus 64k | — | — | — | — | — | — | — | 同上 |
+| `opus-48k-96.opus` | Opus 96k | 2 | 48000 | — | — | — | — | — | 144000（见「Ogg Opus」） |
+| `opus-48k-mono.opus` | Opus 64k | 1 | 48000 | — | — | — | — | — | 144000（同上） |
 
 **与 ffmpeg 逐样本对比**（整文件，ffmpeg `-f f32le` / `-f s16le`，样本数完全相同）：
 
@@ -118,6 +118,41 @@ Ogg 容器 + Vorbis I **整条解码链**：三个头包、audio packet、floor 
 **`zig build bench` 的 Vorbis 行**：3 秒 44.1 kHz/立体声 q4 循环到 20 秒，约 **380x 实时**（目标 100x，ReleaseFast）。
 
 ffprobe 只暴露声道、采样率和时长（正好对上 `total_frames`）；码本 / floor / residue / mode 的数量用一个独立的 Python 参考解析器按 Vorbis I 规范交叉核对。坏 CRC（页体翻一字节）→ `error.Corrupt`；截断（页体切 5 字节）→ `error.Truncated`，两者都在 `read` 阶段报出（`open` 只读头几页，这是流式解码的应有行为）。
+
+### Ogg Opus：容器已支持、解码未实现
+
+Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，逐包决定用哪一层。所以这一轮只做**容器与包结构**——能读文件、知道多长、有几帧、什么配置——解码留给后面的轮次。代价小，收益立刻可见：文件列表终于能显示 `.opus` 的时长。
+
+| 能力 | 状态 | 说明 |
+| --- | --- | --- |
+| `OpusHead`（RFC 7845 §5.1） | ✅ | magic、version、channels、**pre-skip**（u16 LE）、input sample rate、output gain（Q7.8，i16）、mapping family |
+| channel mapping family 0 | ✅ | 单流单声道/立体声；stream count 固定 1、coupled count 固定 `C-1`，不编码 |
+| channel mapping family 1 | ✅ | 解析 stream count / coupled count / mapping table（255 = 静音），并校验 `N≥1`、`M≤N`、`M+N≤255`、每个 index `< M+N` 或 `255`；不合法 → `error.Corrupt` |
+| family ≥ 2（Ambisonics） | ❌ `error.Unsupported` | 明确拒绝，不静默忽略 mapping table |
+| `OpusTags`（RFC 7845 §5.2） | ✅ 校验 magic、跳过后面的 vendor + 条目 | 结构走通（长度自洽），内容不暴露 |
+| TOC 帧结构（RFC 6716 §3.2） | ✅ | config / stereo / frame count code 0–3、1–2 字节帧长、padding、每帧大小与偏移 |
+| `Info.total_frames` | ✅ | `最后一页 granule − pre_skip`；**granule 含 pre-skip** |
+| `open` / PCM | ❌ `error.Unsupported` | 解析完整条流后拒绝；不伪造静音 |
+
+五个素材（`opus.inspect` 的真实输出，与 `ffprobe -show_entries stream=...` 逐项对齐）：
+
+| 素材 | 声道 | pre_skip | input_rate | gain | family | total_frames | granule（= ffprobe `duration_ts`） | 包数 | 帧/包 | 配置分布 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `opus-48k-128-20ms.opus` | 2 | 312 | 48000 | 0 | 0 | 96000 | 96312 | 101 | 1 | 31 ×101 |
+| `opus-48k-24-voip.opus` | 1 | 312 | 48000 | 0 | 0 | 96000 | 96312 | 101 | 1 | 9 ×11, 15 ×9, 23 ×80, 27 ×1 |
+| `opus-48k-64-60ms.opus` | 2 | 312 | 48000 | 0 | 0 | 96000 | 96312 | 34 | 3 | 27 ×31, 31 ×3 |
+| `opus-48k-96.opus` | 2 | 312 | 48000 | 0 | 0 | 144000 | 144312 | 151 | 1 | 31 ×151 |
+| `opus-48k-mono.opus` | 1 | 312 | 48000 | 0 | 0 | 144000 | 144312 | 151 | 1 | 31 ×151 |
+
+**三种编码路径都被触到**：五个文件合计 CELT 518 包、SILK-only 11 包、Hybrid 9 包（后两者全在 24k VOIP 那个文件里：config 9 = SILK WB 20 ms，config 15 = Hybrid FB 20 ms，config 23/27 = CELT 10/20 ms）。128k/20 ms 与 96k 的音乐素材全是 config 31（CELT 全带 20 ms）。**60 ms 素材是 `code 3` 的 3×20 ms CELT，不是 SILK 长帧**——libopus 在 64k 立体声下选了 CELT，这一点和“长帧就该是 SILK”的直觉相反，表格是按实际字节统计的。
+
+**为什么 `sample_rate` 固定 48000**：Opus 的内部带宽可以在 4/6/8/12/20 kHz 之间逐包切换，但输出采样率只有一个基准 48 kHz；RFC 7845 §5.1 明说 input sample rate 字段“**not** the sample rate to use for playback”，它只是编码前原始素材的提示。所以 `Info.sample_rate` 恒为 48000，提示值单独放在 `input_sample_rate` 里，不参与任何计算。
+
+**为什么 pre-skip 必须从 granule 里减掉**：Opus 编码器有算法延迟，解码器开头要丢掉 `pre_skip` 个样本；而 granule position 记的是**含这段延迟**的绝对样本位置。RFC 7845 §4.3 的公式是 `PCM sample position = granule position − pre-skip`。于是 ffprobe 的 `duration_ts`（= granule，96312 / 144312）比真实音频长度（96000 / 144000）多出正好 312 个样本：**`duration_ts = total_frames + pre_skip`**，五个文件全部对上。反过来说，如果直接拿 granule 当长度，每个文件都会多报 6.5 ms；如果拿包内样本数求和，则会**多报**（96960 / 97920 / 144960）——因为末页的 granule 会把最后一个包截短（end trimming），差值恰好不超过一个包（960/1920/2880），测试里对这条也做了断言。
+
+**不伪造静音**：`open` 解析完头与全部包结构后仍然 `return error.Unsupported`。没有 SILK/CELT 就没有 PCM，返回静音只会把“不支持”变成“能播但没声音”，更难排查。fuzz 里因为 `open` 在解析前就拒绝 Opus，Ogg 输入会**额外**直接喂给 `opus.inspect`，10,000 轮里 1613 次走完 Opus 解析路径，全部落在具名错误集内。
+
+合成用例覆盖真实素材没有的分支：`code 1`（两帧等长）、`code 2`（显式帧长，1 字节与 2 字节两种）、`code 3` 的 CBR/VBR、1 字节与多字节（255 续读）padding、`M=0`、120 ms 上限（48×2.5 ms 通过、49×2.5 ms 拒绝）、超过 1275 字节的帧、以及 `OpusHeaX` 式的坏 magic / 坏版本 / 零声道。真实素材里没有 padding，也没有 `code 1/2`，所以这几条只能靠合成包。
 
 ## 老格式与 Mac 来源：G.711 / ADPCM / AIFF
 
@@ -171,7 +206,8 @@ ffprobe 只暴露声道、采样率和时长（正好对上 `total_frames`）；
 - `src/legacy_vectors_test.zig`：六个真文件的 `probe`/`Info`/`total_frames` 与 `max_diff 0` 验收（文件缺失时打印一行并 `SkipZigTest`）；
 - `src/vorbis_huffman_test.zig` / `vorbis_floor_test.zig` / `vorbis_residue_test.zig` / `vorbis_dsp_test.zig`：规范里那张 8 码字示例表的逐码字回读、稀疏与单码字码本、截断/不可达码、trie 深码、X 列表整表排序（曲线形状回归）、`render_point` 整数插值、dB 表单调性、residue 三种格式的样本落点、IMDCT 对直接余弦和、四种窗形与重叠相加；
 - `src/vorbis_decode_test.zig`：两个 Ogg/Vorbis 真文件**整文件**对 ffmpeg 的 f32 与 s16 输出，逐样本 SNR / 最大差 / 样本数，以及 `ShortBuffer` 与 granule 截断；
-- 变异 fuzz 模板从 4 个扩到 11 个（六种老格式素材与 Ogg/Vorbis 全部在列；Ogg 模板现在真的走完整条解码链），`zig build fuzz` 10000 轮无 panic（本轮 667 万样本）；
+- `src/opus_test.zig` / `src/opus_vectors_test.zig`：`OpusHead` 各字段与 family 0/1、坏 magic/版本/零声道/坏 mapping 的具名错误、32 个 TOC config 与边界 0/11/12/15/16/31、`code 0/1/2/3`、1 字节与 2 字节帧长、1 字节与多字节 padding、120 ms 上限、1275 字节上限；五个真文件与 ffprobe 的 `duration_ts`/`channels`/`sample_rate` 对齐，并逐个包核对「帧大小 + framing + padding == 包长」；
+- 变异 fuzz 模板从 4 个扩到 12 个（六种老格式素材、Ogg/Vorbis 与 Ogg/Opus 全部在列；Ogg 模板真的走完整条解码链，Ogg-Opus 模板另外直接喂给 `opus.inspect`，因为 `open` 在解析前就拒绝 Opus），`zig build fuzz` 10000 轮无 panic（本轮 621 万样本、1613 次 Opus 结构解析）；
 - bench 共 11 行：本轮新增 Ogg Vorbis q4 立体声（约 380x 实时），其余老格式行 6.6k–400k× 实时，均远高于 100x 目标。
 
 ## 这不是 Zig 版 FFmpeg
@@ -197,7 +233,7 @@ ffprobe 只暴露声道、采样率和时长（正好对上 `total_frames`）；
 
 音频不一样：Windows 上 WASAPI 只负责**输出**，系统并不带 FLAC / Opus 解码器；macOS 的 AudioToolbox 对 FLAC 的支持也随版本和容器而变。一个应用如果想“走到哪都能放 FLAC”，最后往往还是得自带解码器。音频格式的专利面也窄得多（FLAC、Opus 都是开放、免专利的），维护成本比视频低一个数量级。
 
-所以这里只做音频：**WAV 已完整（含 G.711 与两种 ADPCM），AIFF PCM 已支持，FLAC 子帧集合已完整**（官方 13 个向量全部整文件逐样本对齐），**Ogg 容器与 Vorbis 头已解析**（PCM 下一轮）。Opus 未支持，评估后再定。
+所以这里只做音频：**WAV 已完整（含 G.711 与两种 ADPCM），AIFF PCM 已支持，FLAC 子帧集合已完整**（官方 13 个向量全部整文件逐样本对齐），**Ogg Vorbis 已完整解码**，**Ogg Opus 已解析到包结构**——能识别、能报时长，解码还没写。
 
 ## 用法
 
@@ -234,8 +270,20 @@ pub fn main() !void {
 // header 至少 4 字节（FLAC/MP3 sync）或 12 字节（WAV）；Ogg 需要 36 字节才能看到首包魔数。
 // 函数不读 reader，也不修改切片。
 if (audio.probe(header)) |format| {
-    // format == .wav、.flac、.mp3、.aiff 或 .ogg_vorbis
+    // format == .wav、.flac、.mp3、.aiff、.ogg_vorbis 或 .ogg_opus
+    // .ogg_opus 只是“认得”：想知道声道/时长用它，别拿去 open。
 }
+```
+
+想在不解码的前提下看 Opus 的结构（这一轮新增）：
+
+```zig
+var reader = std.Io.Reader.fixed(bytes);
+const info = try audio.opus.inspect(allocator, &reader, "");
+// info.channels、info.pre_skip、info.total_frames（已是真实音频长度）、
+// info.granule（= ffprobe 的 duration_ts）、info.packets、info.configs[0..31]
+// 以及 info.sample_rate，恒为 48000。
+// audio.opus.open(...) 会跑同样的解析，然后返回 error.Unsupported。
 ```
 
 已经有整段字节，或只想交出 `std.Io.File`：
@@ -440,17 +488,18 @@ while (true) {
 | `fLaC` | `.flac` | 尝试按 FLAC 打开（支持 CONSTANT / VERBATIM / FIXED / LPC + 三种去相关） |
 | `FORM` … `AIFF` | `.aiff` | 尝试按 AIFF 打开（大端 PCM 8/16/24/32） |
 | `FORM` … `AIFC` | `null` | `error.Unsupported` |
-| `OggS` + 首包 `\x01vorbis`（需要 ≥ 36 字节才能看到首包魔数） | `.ogg_vorbis` | 解析 Ogg + Vorbis 头后 `error.Unsupported`（PCM 下一轮） |
-| `OggS` + `OpusHead`，或其它/未知逻辑流 | `null` | `error.Unsupported` |
+| `OggS` + 首包 `\x01vorbis`（需要 ≥ 36 字节才能看到首包魔数） | `.ogg_vorbis` | 解析 Ogg + Vorbis 头后返回可读 PCM 的 `Decoder` |
+| `OggS` + 首包 `OpusHead`（同样需要 ≥ 36 字节） | `.ogg_opus` | 解析 Ogg + `OpusHead`/`OpusTags` + 全部包的 TOC 后 `error.Unsupported`（解码未实现） |
+| `OggS` + 其它/未知逻辑流 | `null` | `error.Unsupported` |
 | `RF64` / `RIFX` + `WAVE` | `null` | `error.Unsupported` |
 | 其他 | `null` | `error.NotAudio` |
 
-`probe()` 宁可返回 `null` 也不把“看起来像”的东西当成可解码格式；`open()` 也不接受 `probe()` 不会返回的格式。
+`probe()` 宁可返回 `null` 也不把“看起来像”的东西当成可解码格式。`.ogg_opus` 是唯一的例外：它是一个**已识别但尚不能解码**的格式，`probe` 如实报出容器与编码器，文件名、声道、时长（`opus.inspect`）都能用上，但 `open` 不会给它编造 PCM。`open()` 也不接受 `probe()` 不会返回的格式。
 
 ## 公共 API
 
 ```zig
-pub const Format = enum { wav, flac, mp3, aiff, ogg_vorbis };
+pub const Format = enum { wav, flac, mp3, aiff, ogg_vorbis, ogg_opus };
 
 pub const Info = struct {
     format: Format,
@@ -503,7 +552,7 @@ pub const Decoder = struct {
 - **声道原样保留**：不做下混、不做上混、不做采样率转换。5.1 就是 6 声道。
 - **reader / 文件生命周期**：`open` 的 `reader` 由调用方持有；`openBytes` 的 `bytes` 不被复制；`openFile*` 的 `file` 不被关闭。三者都必须比 `Decoder` 活得久，`deinit()` 只释放 decoder 自己分配的东西。
 - **错误后不复用**：`read()` 返回任何错误后，这个 decoder 的状态不再保证，直接 `deinit()`；不要用“再读一次”来探测错误是否消失。
-- **入口会消费流**：`open()` 读取 12 字节签名并扫描元数据/chunk，直到首个音频帧（WAV 是 `data` 负载，FLAC 是第一帧）起点；`openFile*` 用 positional reader 从 offset 0 开始；失败时也可能已经消费了最多 12 字节（甚至更多头部）。Ogg 这一轮为了从最后一页的 granule 得到 `total_frames`，`open()` 会读完整段流再返回 `error.Unsupported`。想先判断而不消费，用 `probe()`（需要调用方自己准备那几字节；Ogg 要 36 字节）。
+- **入口会消费流**：`open()` 读取 12 字节签名并扫描元数据/chunk，直到首个音频帧（WAV 是 `data` 负载，FLAC 是第一帧）起点；`openFile*` 用 positional reader 从 offset 0 开始；失败时也可能已经消费了最多 12 字节（甚至更多头部）。Ogg 的 `open()` 只读到三个 Vorbis 头包就返回流式 decoder，`total_frames` 要读到末页 granule 才知道，所以 `read()` 到 EOF 后才填上；Opus 的 `opus.open()` 会读完整条流的包结构再返回 `error.Unsupported`，`opus.inspect()` 则把结构视图交出来。想先判断而不消费，用 `probe()`（需要调用方自己准备那几字节；Ogg 要 36 字节）。
 - **错误不吞**：截断、损坏、不支持、I/O 失败分别有具名错误；不使用 `catch {}` 把问题变成静音。
 
 ### PCM 输出规则（逐比特可复现）
@@ -553,7 +602,7 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 - **解码器无全局状态**：没有单例、没有线程局部缓存、没有全局注册表；两个 decoder 可以并发解不同的流。唯一的例外是 `openFile()` 这个不带 `Io` 的便利入口——它必须从某处拿到 `Io`，使用的是 std 的 `Threaded.global_single_threaded`（单线程、阻塞）。需要并发、取消或自定义事件循环时，用 `openFileWithIo()` 或 `open()`。
 - **无分配（或显式 allocator）**：WAV 的 PCM / float / G.711 路径零分配；WAV 的 ADPCM 在 `open*()` 用调用方的 allocator 分配**一个压缩块 + 一个解码块**；FLAC 在 `open*()` 分配**一帧**的 i32 缓冲；`read()` 永远不分配；`deinit()` 释放。
 - **显式错误**：`NotAudio` / `Unsupported` / `Truncated` / `Corrupt` / `Io` / `OutOfMemory` / `ShortBuffer`；没有“静音代替错误”。
-- **可 fuzz**：解析器只接受 `[]const u8` 和 `std.Io.Reader`，没有文件系统、线程、时间依赖；`zig build fuzz` 对 11 种合法模板（WAV / FLAC / MP3 mono / MP3 stereo / µ-law / A-law / IMA ADPCM / MS ADPCM / AIFF16 / AIFF24 / Ogg-Vorbis）做随机变异，断言不 panic、不越界、错误具名。
+- **可 fuzz**：解析器只接受 `[]const u8` 和 `std.Io.Reader`，没有文件系统、线程、时间依赖；`zig build fuzz` 对 12 种合法模板（WAV / FLAC / MP3 mono / MP3 stereo / µ-law / A-law / IMA ADPCM / MS ADPCM / AIFF16 / AIFF24 / Ogg-Vorbis / Ogg-Opus）做随机变异，断言不 panic、不越界、错误具名。
 
 ## 构建与测试
 
@@ -561,8 +610,8 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 
 ```sh
 zig build            # 编译库（static lib 到 zig-out/）
-zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz（11 种模板）
-zig build fuzz       # 10000 轮变异 fuzz（WAV / FLAC / MP3 / G.711 / ADPCM / AIFF / Ogg-Vorbis 共 11 种模板）
+zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz（12 种模板，248 个测试）
+zig build fuzz       # 10000 轮变异 fuzz（WAV / FLAC / MP3 / G.711 / ADPCM / AIFF / Ogg-Vorbis / Ogg-Opus 共 12 种模板）
 zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）、MP3 与老格式解码基准（ReleaseFast；低于目标会失败）
 ```
 
@@ -593,7 +642,10 @@ src/ogg.zig         Ogg 页、CRC-32、packet 拼装、首音频流选择
 src/vorbis.zig      Vorbis identification / comment / setup（floor、residue、mapping、mode）
 src/vorbis_bits.zig LSB-first 位读取 + ilog / lookup1_values
 src/vorbis_codebook.zig  码本长度表与 VQ lookup（含 type 1 lattice）
-src/ogg_build.zig / vorbis_build.zig  测试专用 Ogg 页 / Vorbis 头写入器（不进库）
+src/opus.zig        Ogg Opus 入口（inspect 结构视图 / open 解析后明确 Unsupported）
+src/opus_head.zig   OpusHead / OpusTags（RFC 7845）
+src/opus_packet.zig TOC 与帧打包（RFC 6716 §3.2）：帧数、帧长、padding、每帧样本数
+src/ogg_build.zig / vorbis_build.zig / opus_build.zig  测试专用 Ogg 页 / Vorbis 头 / Opus 头与包的写入器（不进库）
 src/bench.zig       WAV + FLAC + MP3 + 老格式基准程序
 src/fuzz.zig        变异 fuzzer（同时作为 1000 轮测试运行）
 src/compare.zig     与 ffmpeg 逐样本比较的测试辅助

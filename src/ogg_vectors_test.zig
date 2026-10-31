@@ -252,7 +252,7 @@ test "ogg vectors: selected setup fields match the reference parser" {
     }
 }
 
-test "ogg vectors: Opus is identified as Ogg but never as Vorbis" {
+test "ogg vectors: Opus is identified as Ogg, named Opus, never Vorbis" {
     const names = [_][]const u8{ "opus-48k-96.opus", "opus-48k-mono.opus" };
     var ran: usize = 0;
     for (names) |name| {
@@ -263,7 +263,8 @@ test "ogg vectors: Opus is identified as Ogg but never as Vorbis" {
         defer testing.allocator.free(bytes);
 
         try testing.expectEqual(ogg.Codec.opus, ogg.identify(bytes));
-        try testing.expectEqual(@as(?root.Format, null), root.probe(bytes));
+        // Named as Opus, never as Vorbis, and never guessed from 12 bytes.
+        try testing.expectEqual(root.Format.ogg_opus, root.probe(bytes).?);
         try testing.expectEqual(@as(?root.Format, null), root.probe(bytes[0..12]));
 
         var reader = std.Io.Reader.fixed(bytes);

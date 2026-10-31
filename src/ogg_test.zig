@@ -312,7 +312,9 @@ test "ogg: Opus is identified, but never claimed as Vorbis" {
     defer testing.allocator.free(bytes);
 
     try testing.expectEqual(ogg.Codec.opus, ogg.identify(bytes));
-    try testing.expectEqual(@as(?root.Format, null), root.probe(bytes));
+    // The container layer names Opus as `.ogg_opus`; the Opus parser is what
+    // reads the head, and `open` still refuses because there is no decoder.
+    try testing.expectEqual(root.Format.ogg_opus, root.probe(bytes).?);
 
     var reader = std.Io.Reader.fixed(bytes);
     var demux = try ogg.Demuxer.init(testing.allocator, &reader, "");
