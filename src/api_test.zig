@@ -5,12 +5,15 @@ const std = @import("std");
 const root = @import("root.zig");
 const testing = std.testing;
 
-test "open: FLAC is recognized but not decoded in v0.1" {
-    const flac_header = "fLaC\x80\x00\x00\x22" ++ "\x00\x00\x00\x00";
-    try testing.expectEqual(root.Format.flac, root.probe(flac_header).?);
+test "open: FLAC dispatches to the FLAC decoder" {
+    // `fLaC` + a STREAMINFO block header (last, type 0, 34 bytes) and the
+    // first four payload bytes. The remaining 30 bytes are missing, so the
+    // named answer is Truncated: the dispatcher reached the FLAC parser.
+    const flac_prefix = "fLaC\x80\x00\x00\x22" ++ "\x00\x10\x00\x10";
+    try testing.expectEqual(root.Format.flac, root.probe(flac_prefix).?);
 
-    var reader = std.Io.Reader.fixed(flac_header);
-    try testing.expectError(error.Unsupported, root.open(testing.allocator, &reader));
+    var reader = std.Io.Reader.fixed(flac_prefix);
+    try testing.expectError(error.Truncated, root.open(testing.allocator, &reader));
 }
 
 test "open: RF64 and RIFX are recognized and rejected by name" {

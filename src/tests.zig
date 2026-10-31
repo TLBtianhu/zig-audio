@@ -3,6 +3,7 @@ test {
     _ = @import("wav_test.zig");
     _ = @import("api_test.zig");
     _ = @import("fixtures_test.zig");
+    _ = @import("flac_test.zig");
     _ = @import("flac_vectors_test.zig");
     _ = @import("ffmpeg_test.zig");
     _ = @import("fuzz.zig");

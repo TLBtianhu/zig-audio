@@ -1,8 +1,9 @@
 //! zig-audio: streaming audio decoding in pure Zig.
 //!
-//! v0.1 ships the public API and a streaming WAV decoder. FLAC is recognized
-//! by `probe` and its decoder arrives next; `open` reports `Unsupported` for
-//! it today so callers get a named answer instead of a guess.
+//! v0.2 adds a FLAC decoder covering the independent-channel subset:
+//! CONSTANT, VERBATIM and FIXED(0..4) subframes with Rice partitions. LPC and
+//! the left/side, right/side and mid/side assignments are recognized and
+//! reported as `Unsupported` (see README for the support matrix).
 //!
 //! The API deliberately has one output path: interleaved i16. Source PCM
 //! (8/16/24/32) and float32 are converted inside the decoder, so a player
@@ -11,6 +12,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const wav = @import("wav.zig");
+const flac = @import("flac.zig");
 
 pub const Format = types.Format;
 pub const Info = types.Info;
@@ -48,8 +50,12 @@ pub fn open(allocator: std.mem.Allocator, reader: *std.Io.Reader) Error!Decoder 
     if (got < header.len) return error.Truncated;
 
     if (std.mem.eql(u8, header[0..4], "fLaC")) {
-        // probe() already recognizes it; the decoder lands in the next version.
-        return error.Unsupported;
+        const dec = try flac.open(allocator, reader, &header);
+        return .{
+            .info = dec.info,
+            .allocator = allocator,
+            .impl = .{ .flac = dec },
+        };
     }
 
     if (std.mem.eql(u8, header[0..4], "RIFF") and std.mem.eql(u8, header[8..12], "WAVE")) {
@@ -79,6 +85,7 @@ pub const Decoder = struct {
     allocator: std.mem.Allocator,
     impl: union(enum) {
         wav: wav.Decoder,
+        flac: flac.Decoder,
     },
 
     /// Decode up to `out.len / info.channels` frames into `out` as
@@ -86,10 +93,12 @@ pub const Decoder = struct {
     ///
     /// Samples are frame-major: frame `f`, channel `c` is
     /// `out[f * info.channels + c]`, with source channel order preserved.
-    /// Conversion is fixed for every source format: 8-bit unsigned PCM uses
-    /// `(byte - 128) << 8`, 16-bit is copied, 24-bit is shifted right by 8,
-    /// 32-bit by 16, and float32 is clamped to [-1, 1] and rounded to i16.
-    /// Integer conversions match ffmpeg `-f s16le` sample for sample.
+    /// Conversion is fixed for every source format: 8-bit unsigned WAV PCM uses
+    /// `(byte - 128) << 8`, FLAC 8-bit is signed (`sample << 8`), 16-bit is
+    /// copied, and wider sources shift right so the top 16 bits survive
+    /// (WAV 24-bit by 8, 32-bit by 16; FLAC by `bits - 16`). Float32 is clamped
+    /// to [-1, 1] and rounded to i16. Integer conversions match ffmpeg
+    /// `-f s16le` sample for sample.
     ///
     /// Returns 0 at end of stream. An empty `out` is a no-op that also returns
     /// 0, so callers must not use a zero-length read as an EOF probe. The tail
@@ -98,6 +107,7 @@ pub const Decoder = struct {
     pub fn read(self: *Decoder, out: []i16) Error!usize {
         switch (self.impl) {
             .wav => |*dec| return dec.read(out),
+            .flac => |*dec| return dec.read(out),
         }
     }
 
@@ -105,6 +115,7 @@ pub const Decoder = struct {
     pub fn deinit(self: *Decoder) void {
         switch (self.impl) {
             .wav => |*dec| dec.deinit(),
+            .flac => |*dec| dec.deinit(),
         }
         self.* = undefined;
     }

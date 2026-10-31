@@ -1,9 +1,15 @@
-//! Test helper: compare this decoder's i16 output against ffmpeg's `-f s16le`
-//! reference, sample by sample (bytes are little-endian, exactly what
-//! `-f s16le` writes).
+//! Test helper: compare this decoder's i16 output against ffmpeg's raw PCM,
+//! sample by sample.
 //!
-//! This is the mechanism the FLAC round will use to prove bit-exact decoding:
-//! decode the same file with both implementations and require max_diff == 0.
+//! Three modes:
+//!   * `expectExact` — full file, ffmpeg `-f s16le` (integer sources <= 16 bit,
+//!     and WAV's own conversion rules);
+//!   * `expectExactS32` — full file, ffmpeg `-f s32le`, reference shifted right
+//!     by 16. This is the rule for FLAC sources wider than 16 bits;
+//!   * `expectPrefixExact` — the longest decodable prefix of a stream that
+//!     later returns `Unsupported` (the official vectors), compared against the
+//!     first N samples of ffmpeg's full decode.
+//!
 //! For float WAV input a tolerance of 1 LSB may be used, because the source is
 //! not integer PCM and ffmpeg's float->s16 rounding is not part of the format.
 
@@ -22,13 +28,44 @@ pub const Result = struct {
     first_ref: i16 = 0,
 };
 
-/// Decode `bytes` with zig-audio and with ffmpeg, and return the largest
-/// absolute difference between corresponding i16 samples.
-pub fn compareWithFfmpeg(allocator: std.mem.Allocator, bytes: []const u8) !Result {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+pub const Prefix = struct {
+    samples: []i16,
+    err: ?root.Error,
+};
 
-    const ours = try testutil.decodeAll(allocator, bytes, 512);
-    defer allocator.free(ours);
+/// Decode as much as the stream allows, keeping the samples delivered before
+/// the first error. `err` is null when the stream ended cleanly.
+pub fn decodePrefix(allocator: std.mem.Allocator, bytes: []const u8) !Prefix {
+    var reader = std.Io.Reader.fixed(bytes);
+    var dec = root.open(allocator, &reader) catch |err| {
+        return .{ .samples = try allocator.alloc(i16, 0), .err = err };
+    };
+    defer dec.deinit();
+
+    const channels: usize = dec.info.channels;
+    var list: std.ArrayList(i16) = .empty;
+    errdefer list.deinit(allocator);
+
+    var buffer: [4096]i16 = undefined;
+    while (true) {
+        const n = dec.read(&buffer) catch |err| {
+            return .{ .samples = try list.toOwnedSlice(allocator), .err = err };
+        };
+        if (n == 0) break;
+        try list.appendSlice(allocator, buffer[0..n]);
+        if (n % channels != 0) return error.UnalignedRead;
+    }
+    return .{ .samples = try list.toOwnedSlice(allocator), .err = null };
+}
+
+/// Run ffmpeg over `bytes` and return its raw little-endian output for
+/// `sample_format` ("s16le" or "s32le").
+fn runFfmpeg(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    sample_format: []const u8,
+) ![]u8 {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -46,10 +83,9 @@ pub fn compareWithFfmpeg(allocator: std.mem.Allocator, bytes: []const u8) !Resul
 
     const result = std.process.run(allocator, std.testing.io, .{
         .argv = &.{
-            ffmpeg_path, "-v",       "error",
-            "-i",        input_path, "-f",
-            "s16le",     "-c:a",     "pcm_s16le",
-            "pipe:1",
+            ffmpeg_path,   "-v",       "error",
+            "-i",          input_path, "-f",
+            sample_format, "pipe:1",
         },
         .stdout_limit = .limited(64 << 20),
         .stderr_limit = .limited(1 << 20),
@@ -57,32 +93,25 @@ pub fn compareWithFfmpeg(allocator: std.mem.Allocator, bytes: []const u8) !Resul
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
-    defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     if (!result.term.success()) {
         std.debug.print("ffmpeg reference decode failed: {s}\n", .{result.stderr});
+        allocator.free(result.stdout);
         return error.FfmpegFailed;
     }
-    if (result.stdout.len % 2 != 0) return error.OddReferenceLength;
+    return result.stdout;
+}
 
-    const reference_samples = result.stdout.len / 2;
-    if (reference_samples != ours.len) {
-        std.debug.print(
-            "sample count mismatch: zig-audio {d}, ffmpeg {d}\n",
-            .{ ours.len, reference_samples },
-        );
-        return error.SampleCountMismatch;
-    }
-
+fn diff(ours: []const i16, reference: []const i16) Result {
     var max_diff: u16 = 0;
     var first_mismatch: ?usize = null;
     var first_ours: i16 = 0;
     var first_ref: i16 = 0;
     for (ours, 0..) |ours_sample, i| {
-        const ref_sample = std.mem.readInt(i16, result.stdout[i * 2 ..][0..2], .little);
-        const diff: i32 = @as(i32, ours_sample) - @as(i32, ref_sample);
-        const abs_diff: u16 = @intCast(if (diff < 0) -diff else diff);
+        const ref_sample = reference[i];
+        const delta: i32 = @as(i32, ours_sample) - @as(i32, ref_sample);
+        const abs_diff: u16 = @intCast(if (delta < 0) -delta else delta);
         if (abs_diff != 0 and first_mismatch == null) {
             first_mismatch = i;
             first_ours = ours_sample;
@@ -90,7 +119,6 @@ pub fn compareWithFfmpeg(allocator: std.mem.Allocator, bytes: []const u8) !Resul
         }
         if (abs_diff > max_diff) max_diff = abs_diff;
     }
-
     return .{
         .samples = ours.len,
         .max_diff = max_diff,
@@ -100,39 +128,123 @@ pub fn compareWithFfmpeg(allocator: std.mem.Allocator, bytes: []const u8) !Resul
     };
 }
 
-/// Require bit-exact agreement. Prints the failing sample and both values.
-pub fn expectExact(allocator: std.mem.Allocator, bytes: []const u8) !void {
-    const result = try compareWithFfmpeg(allocator, bytes);
-    if (result.max_diff != 0) {
-        std.debug.print(
-            "PCM mismatch: {d} samples, max diff {d}, first at {d}: ours {d}, ffmpeg {d}\n",
-            .{
-                result.samples,
-                result.max_diff,
-                result.first_mismatch.?,
-                result.first_ours,
-                result.first_ref,
-            },
-        );
-        return error.PcmMismatch;
+fn report(result: Result, tolerance: u16) !void {
+    if (result.max_diff <= tolerance) return;
+    std.debug.print(
+        "PCM mismatch: {d} samples, max diff {d} > tolerance {d}, first at {d}: ours {d}, ffmpeg {d}\n",
+        .{
+            result.samples,
+            result.max_diff,
+            tolerance,
+            result.first_mismatch.?,
+            result.first_ours,
+            result.first_ref,
+        },
+    );
+    return error.PcmMismatch;
+}
+
+/// Decode `bytes` with zig-audio and with ffmpeg `-f s16le`, and return the
+/// largest absolute difference between corresponding samples.
+pub fn compareWithFfmpeg(allocator: std.mem.Allocator, bytes: []const u8) !Result {
+    const ours = try testutil.decodeAll(allocator, bytes, 512);
+    defer allocator.free(ours);
+
+    const raw = try runFfmpeg(allocator, bytes, "s16le");
+    defer allocator.free(raw);
+    if (raw.len % 2 != 0) return error.OddReferenceLength;
+
+    const reference = try allocator.alloc(i16, raw.len / 2);
+    defer allocator.free(reference);
+    for (reference, 0..) |*slot, i| {
+        slot.* = std.mem.readInt(i16, raw[i * 2 ..][0..2], .little);
     }
+
+    if (reference.len != ours.len) {
+        std.debug.print(
+            "sample count mismatch: zig-audio {d}, ffmpeg {d}\n",
+            .{ ours.len, reference.len },
+        );
+        return error.SampleCountMismatch;
+    }
+    return diff(ours, reference);
+}
+
+/// Like `compareWithFfmpeg`, but the reference is `-f s32le` shifted right by
+/// 16: the documented conversion for FLAC sources wider than 16 bits.
+pub fn compareWithFfmpegS32(allocator: std.mem.Allocator, bytes: []const u8) !Result {
+    const ours = try testutil.decodeAll(allocator, bytes, 512);
+    defer allocator.free(ours);
+
+    const raw = try runFfmpeg(allocator, bytes, "s32le");
+    defer allocator.free(raw);
+    if (raw.len % 4 != 0) return error.OddReferenceLength;
+
+    const reference = try allocator.alloc(i16, raw.len / 4);
+    defer allocator.free(reference);
+    for (reference, 0..) |*slot, i| {
+        const wide = std.mem.readInt(i32, raw[i * 4 ..][0..4], .little);
+        slot.* = @intCast(wide >> 16);
+    }
+
+    if (reference.len != ours.len) {
+        std.debug.print(
+            "sample count mismatch: zig-audio {d}, ffmpeg(s32) {d}\n",
+            .{ ours.len, reference.len },
+        );
+        return error.SampleCountMismatch;
+    }
+    return diff(ours, reference);
+}
+
+/// Require bit-exact agreement with ffmpeg's s16 output. Prints the first
+/// failing sample and both values.
+pub fn expectExact(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    try report(try compareWithFfmpeg(allocator, bytes), 0);
+}
+
+/// Require bit-exact agreement after the s32 reference is shifted right by 16.
+pub fn expectExactS32(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    try report(try compareWithFfmpegS32(allocator, bytes), 0);
 }
 
 /// Require agreement within `tolerance` LSBs (use 0 for integer PCM).
 pub fn expectWithin(allocator: std.mem.Allocator, bytes: []const u8, tolerance: u16) !void {
-    const result = try compareWithFfmpeg(allocator, bytes);
-    if (result.max_diff > tolerance) {
+    try report(try compareWithFfmpeg(allocator, bytes), tolerance);
+}
+
+/// Compare the longest decodable prefix of `bytes` (a stream that later
+/// returns `Unsupported`) against the first N samples of ffmpeg's full decode.
+/// Returns the prefix length in samples.
+pub fn expectPrefixExact(allocator: std.mem.Allocator, bytes: []const u8) !usize {
+    const prefix = try decodePrefix(allocator, bytes);
+    defer allocator.free(prefix.samples);
+
+    const raw = try runFfmpeg(allocator, bytes, "s16le");
+    defer allocator.free(raw);
+    if (raw.len % 2 != 0) return error.OddReferenceLength;
+    const reference_samples = raw.len / 2;
+    if (reference_samples < prefix.samples.len) {
         std.debug.print(
-            "PCM mismatch: {d} samples, max diff {d} > tolerance {d}, first at {d}: ours {d}, ffmpeg {d}\n",
-            .{
-                result.samples,
-                result.max_diff,
-                tolerance,
-                result.first_mismatch.?,
-                result.first_ours,
-                result.first_ref,
-            },
+            "prefix longer than reference: prefix {d}, ffmpeg {d}\n",
+            .{ prefix.samples.len, reference_samples },
         );
-        return error.PcmMismatch;
+        return error.SampleCountMismatch;
     }
+
+    var max_diff: u16 = 0;
+    for (prefix.samples, 0..) |ours, i| {
+        const theirs = std.mem.readInt(i16, raw[i * 2 ..][0..2], .little);
+        const delta: i32 = @as(i32, ours) - @as(i32, theirs);
+        const abs_diff: u16 = @intCast(if (delta < 0) -delta else delta);
+        if (abs_diff != 0) {
+            std.debug.print(
+                "prefix mismatch at {d}: ours {d}, ffmpeg {d}\n",
+                .{ i, ours, theirs },
+            );
+            return error.PcmMismatch;
+        }
+        if (abs_diff > max_diff) max_diff = abs_diff;
+    }
+    return prefix.samples.len;
 }

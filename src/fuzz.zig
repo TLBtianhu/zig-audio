@@ -1,5 +1,6 @@
-//! Mutation fuzzer: start from a valid WAV, flip/truncate bytes, and drive the
-//! public parser/decoder through every reachable error path.
+//! Mutation fuzzer: start from a valid WAV and a valid FLAC, flip/truncate
+//! bytes, and drive the public parser/decoder through every reachable error
+//! path.
 //!
 //! The same `run` function is used by `zig build fuzz` (10,000 rounds) and by a
 //! normal test (1,000 rounds), so CI always exercises it.
@@ -7,6 +8,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const testutil = @import("testutil.zig");
+const flac_build = @import("flac_build.zig");
 
 pub const default_rounds: usize = 10_000;
 pub const default_seed: u64 = 0x5EED_2A11_D0C5_1234;
@@ -30,10 +32,13 @@ pub fn main() !void {
 }
 
 pub fn run(allocator: std.mem.Allocator, rounds: usize, seed: u64) !Stats {
-    const base = try testutil.buildDemoPcm16(allocator, 512);
-    defer allocator.free(base);
+    const wav_base = try testutil.buildDemoPcm16(allocator, 512);
+    defer allocator.free(wav_base);
 
-    const buf = try allocator.dupe(u8, base);
+    const flac_base = try buildFlacTemplate(allocator);
+    defer allocator.free(flac_base);
+
+    const buf = try allocator.alloc(u8, @max(wav_base.len, flac_base.len));
     defer allocator.free(buf);
 
     var prng = std.Random.DefaultPrng.init(seed);
@@ -42,6 +47,8 @@ pub fn run(allocator: std.mem.Allocator, rounds: usize, seed: u64) !Stats {
 
     var round: usize = 0;
     while (round < rounds) : (round += 1) {
+        // Half the rounds attack the WAV path, half the FLAC path.
+        const base = if (round % 2 == 0) wav_base else flac_base;
         const len = mutate(random, base, buf);
 
         if (root.probe(buf[0..@min(len, 12)]) != null) stats.probed += 1;
@@ -91,10 +98,48 @@ pub fn run(allocator: std.mem.Allocator, rounds: usize, seed: u64) !Stats {
     return stats;
 }
 
+/// A valid FLAC template with all three Stage A subframe types and a
+/// multi-partition Rice residual, so mutations reach the frame decoder rather
+/// than only the metadata parser.
+fn buildFlacTemplate(allocator: std.mem.Allocator) ![]u8 {
+    const flat: [32]i32 = @splat(1234);
+    var verbatim: [32]i32 = undefined;
+    var fixed: [32]i32 = undefined;
+    for (&verbatim, 0..) |*slot, i| {
+        slot.* = @as(i32, @intCast(i % 11)) * 40 - 200;
+    }
+    for (&fixed, 0..) |*slot, i| {
+        slot.* = @as(i32, @intCast(i)) * 17 - 300;
+    }
+
+    const planes_constant = [_][]const i32{&flat};
+    const planes_verbatim = [_][]const i32{&verbatim};
+    const planes_fixed = [_][]const i32{&fixed};
+    const frames = [_]flac_build.Frame{
+        .{ .block_size = 32, .modes = &.{.constant}, .samples = &planes_constant },
+        .{ .block_size = 32, .modes = &.{.verbatim}, .samples = &planes_verbatim },
+        .{
+            .block_size = 32,
+            .modes = &.{.fixed},
+            .samples = &planes_fixed,
+            .fixed_order = 2,
+            .partition_order = 1,
+            .rice_param = 1,
+        },
+    };
+    return flac_build.build(allocator, .{
+        .sample_rate = 44_100,
+        .channels = 1,
+        .bits_per_sample = 16,
+        .total_samples = 96,
+        .frames = &frames,
+    });
+}
+
 /// Copy the valid template, then apply one mutation strategy. Returns the
 /// (possibly shortened) length.
 fn mutate(random: std.Random, base: []const u8, buf: []u8) usize {
-    @memcpy(buf, base);
+    @memcpy(buf[0..base.len], base);
     var len: usize = base.len;
 
     const roll = random.uintLessThan(u8, 100);

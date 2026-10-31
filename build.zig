@@ -55,6 +55,6 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     const run_bench = b.addRunArtifact(bench_exe);
-    const bench_step = b.step("bench", "Benchmark 10 s of 16-bit stereo WAV decoding");
+    const bench_step = b.step("bench", "Benchmark WAV and FLAC decoding against a realtime target");
     bench_step.dependOn(&run_bench.step);
 }

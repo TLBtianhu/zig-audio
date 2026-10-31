@@ -289,15 +289,26 @@ pub const ChunkedReader = struct {
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const self = selfFromInterface(r);
-        for (data) |dst| {
-            if (dst.len == 0) continue;
-            const n = self.nextLen(.limited(dst.len));
+        if (data.len == 0) return 0;
+        const dst = data[0];
+        if (dst.len == 0) {
+            // `std.Io.Reader` contract: when the caller has no buffer the
+            // implementation fills `Reader.buffer` and returns 0. Returning 0
+            // *without* filling makes `fillUnbuffered` spin forever, which the
+            // FLAC path (peekByte/takeByte) exercises but the WAV path does not.
+            const space = r.buffer.len - r.end;
+            const n = self.nextLen(.limited(space));
             if (n == 0) return error.EndOfStream;
-            @memcpy(dst[0..n], self.source[self.pos..][0..n]);
+            @memcpy(r.buffer[r.end..][0..n], self.source[self.pos..][0..n]);
+            r.end += n;
             self.pos += n;
-            return n;
+            return 0;
         }
-        return 0;
+        const n = self.nextLen(.limited(dst.len));
+        if (n == 0) return error.EndOfStream;
+        @memcpy(dst[0..n], self.source[self.pos..][0..n]);
+        self.pos += n;
+        return n;
     }
 };
 
