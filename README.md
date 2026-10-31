@@ -10,6 +10,7 @@
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
+| 入口 | ✅ | `open` / `openBytes` / `openFile`：`*std.Io.Reader`、内存切片、`std.Io.File` 三个便利入口，错误契约相同 |
 | STREAMINFO（块大小、采样率、声道、位深、total samples、MD5） | ✅ | `total_samples == 0` → `Info.total_frames = null` |
 | 其它元数据块（padding / seektable / Vorbis comment…） | ✅ | 按长度跳过，遇 last-metadata-block 停止 |
 | 帧头（同步码、blocking strategy、8/16 位块大小扩展、采样率编码、声道分配、位深编码） | ✅ | 帧头 CRC-8 校验 |
@@ -22,7 +23,7 @@
 
 **LPC 预测语义**（RFC 9639 §9.2.6、附录 A.3/A.4）：`prediction = (Σ coeff[i] × sample[n-1-i]) >> shift`，其中 `Σ` 在 i64 中累加（最坏情况约 33 + 15 + 5 = 53 位），**预测值不按子帧位深截断**——它可能远大于 16 位样本范围，要等加上残差后才落回样本范围；提前截断高位会得到"听起来正常但样本错误"的输出。`shift` 为负时按历史语义左移；规范要求编码器不得写负值，解码端接受它并做了溢出检查。最终样本 + 残差用带溢出检查的加法写入 i32，任何越界都返回 `error.Corrupt`，绝不回绕。
 
-**内存**：`open()` 按 STREAMINFO 的 max block size 分配一帧的 i32 缓冲（常见 4096×2×4 = 32 KiB，上限 65535×8×4 = 2 MiB），`read()` 之后不再分配；`deinit()` 释放。
+**内存**：`open*()` 按 STREAMINFO 的 max block size 分配一帧的 i32 缓冲（常见 4096×2×4 = 32 KiB，上限 65535×8×4 = 2 MiB），`read()` 之后不再分配；`deinit()` 释放。`openFile*()` 另加一块 64 KiB 的文件读缓冲。
 
 **官方测试向量**：13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 文件**全部整文件解码**，并与 ffmpeg 逐样本 `max_diff 0`。这批文件覆盖 LPC 阶数（subset 范围内）与 qlp 精度 2/15、wasted 1–12、8/12/16 位、1/3/6 声道、三种去相关、总样本数未知（`total_frames = null`）与 escape-code 分区。测试分两层：
 1. 官方向量：元数据必须完全正确，整文件样本数等于声明值（`45` 例外，按实际解码数），并与 ffmpeg 逐样本一致；`60` 的 50% 截断必须返回 `error.Truncated`；
@@ -93,7 +94,128 @@ if (audio.probe(header)) |format| {
 }
 ```
 
-`probe()` 是纯函数；`open()` 会消费流。两者都不“猜”格式：认不出来就是 `error.NotAudio`。
+已经有整段字节，或只想交出 `std.Io.File`：
+
+```zig
+// 不复制 bytes；调用方保证它在 dec.deinit() 之前一直有效。
+var dec = try audio.openBytes(allocator, bytes);
+defer dec.deinit();
+
+// 流式读文件；库不拥有 file，deinit 不会关闭它（读缓冲 64 KiB）。
+var dec2 = try audio.openFile(allocator, file);
+defer dec2.deinit();
+```
+
+`probe()` 是纯函数；`open()` / `openBytes()` / `openFile()` 都会消费流（`openFile` 从 offset 0 开始）。它们都不“猜”格式：认不出来就是 `error.NotAudio`。
+
+## 接入你自己的文件层
+
+`open()` 只要求一个 `*std.Io.Reader`。这不是“本库不认识你的文件”的借口，而是入口：**任何能按字节产出数据的文件层，都可以用一块自己的缓冲包成 Reader**。不需要把整个文件读进内存，也不需要本库认识你的 `HANDLE`。
+
+### 为什么不要整文件读进来
+
+OTTO 的第一版集成是：`CreateFileW` → 把整个文件读进内存 → `std.Io.Reader.fixed(bytes)`。它能出声，但峰值内存 = 压缩文件 + 解出的 PCM；一个 200 MB 的 FLAC 会先占 200 MB，再叠加 PCM。这正是“流式解码器”最容易自欺的地方：解码器是流式的，喂给它的却是全量缓冲。
+
+`openFile()` 内部也只是 `file.reader(io, &buffer)`（64 KiB）+ `open()`：文件多大都只占这一块读缓冲。测试里用 512 KiB 的 WAV + 128 KiB 的固定分配器验证了这一点——如果实现预读整个文件，`openFile` 会直接 `OutOfMemory`。另一个测试给 `Io` 套了计数 vtable：一个 524332 字节的 WAV 只发了 **68 次**文件读（平均约 7.5 KiB/次），而不是一次 512 KiB——既没有整文件缓冲，也没有按字节读。
+
+### 最小 Reader 骨架
+
+假设你的文件层已经有一个“往 `dst` 写、返回字节数、0 表示 EOF”的函数：
+
+```zig
+/// 你的文件层：Win32 HANDLE、自己的预读缓冲、内存映射、网络流……都可以。
+/// `readFn` 就是把你已有的读文件函数接上来（I/O 失败返回 error.ReadFailed）。
+const Handle = struct {
+    ctx: *anyopaque,
+    readFn: *const fn (ctx: *anyopaque, dst: []u8) std.Io.Reader.Error!usize,
+
+    fn read(self: Handle, dst: []u8) std.Io.Reader.Error!usize {
+        return self.readFn(self.ctx, dst);
+    }
+};
+
+const HandleReader = struct {
+    handle: Handle,
+    interface: std.Io.Reader,
+
+    const vtable = std.Io.Reader.VTable{
+        .stream = stream,
+        .readVec = readVec,
+    };
+
+    /// `buffer` 由调用方持有，必须比 Decoder 活得久。
+    fn init(handle: Handle, buffer: []u8) HandleReader {
+        return .{
+            .handle = handle,
+            .interface = .{ .vtable = &vtable, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    fn self(r: *std.Io.Reader) *HandleReader {
+        return @alignCast(@fieldParentPtr("interface", r));
+    }
+
+    fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const dst = limit.slice(try w.writableSliceGreedy(1));
+        const n = self(r).handle.read(dst) catch return error.ReadFailed;
+        if (n == 0) return error.EndOfStream;
+        w.advance(n);
+        return n;
+    }
+
+    /// Reader 的其余 API（readSliceShort / peekByte / discard …）最终都会
+    /// 落到 stream 或 readVec 上。readVec 的契约里有一条容易漏：
+    /// `data[0]` 可能长度为 0，此时实现**必须写 Reader.buffer 并返回 0**。
+    /// 若返回 0 却什么都不写，fillUnbuffered 会永远循环（OTTO 踩过）。
+    fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        if (data.len == 0) return 0;
+
+        if (data[0].len != 0) {
+            const n = self(r).handle.read(data[0]) catch return error.ReadFailed;
+            if (n == 0) return error.EndOfStream;
+            return n;
+        }
+
+        // 没有调用方目的地：填 Reader.buffer，返回 0 是“已填好，不是 EOF”。
+        // fillUnbuffered 在调用 readVec 前已经 rebase，保证这里仍有空间。
+        const space = r.buffer[r.end..];
+        if (space.len == 0) return error.EndOfStream;
+        const n = self(r).handle.read(space) catch return error.ReadFailed;
+        if (n == 0) return error.EndOfStream;
+        r.end += n;
+        return 0;
+    }
+};
+```
+
+接到本库：
+
+```zig
+var my_file: MyFile = .{ .handle = h, .offset = 0 };
+const handle = Handle{ .ctx = &my_file, .readFn = MyFile.readSome };
+
+var read_buffer: [64 * 1024]u8 = undefined;
+var reader = HandleReader.init(handle, &read_buffer);
+
+var dec = try audio.open(allocator, &reader.interface);
+defer dec.deinit();
+
+var pcm: [8192]i16 = undefined;
+while (true) {
+    const n = try dec.read(&pcm);
+    if (n == 0) break;
+    // pcm[0..n] 是交错 i16；reader 与 read_buffer 必须活到 dec.deinit()。
+}
+```
+
+两个常见变体：
+
+- **已经有一整段内存**：用 `openBytes(allocator, bytes)`，它就是 `Reader.fixed` 的糖；**不复制**字节，也不接管它的生命周期。
+- **已经是 `std.Io.File`**：用 `openFile(allocator, file)`（单线程阻塞，内部用 `std.Io.Threaded.global_single_threaded`）或 `openFileWithIo(allocator, io, file)`（调用方自带 `Io`，适合并发/取消/自定义事件循环）。库不拥有文件，`deinit` 不关闭它。
 
 ## 支持的格式
 
@@ -177,6 +299,9 @@ pub const Error = error{
 
 pub fn probe(header: []const u8) ?Format;
 pub fn open(allocator: std.mem.Allocator, reader: *std.Io.Reader) Error!Decoder;
+pub fn openBytes(allocator: std.mem.Allocator, bytes: []const u8) Error!Decoder;
+pub fn openFile(allocator: std.mem.Allocator, file: std.Io.File) Error!Decoder;
+pub fn openFileWithIo(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Decoder;
 
 pub const Decoder = struct {
     info: Info,
@@ -185,17 +310,26 @@ pub const Decoder = struct {
 };
 ```
 
+四个入口的区别：
+
+| 入口 | 数据来源 | 生命周期 | `deinit()` 释放什么 |
+| --- | --- | --- | --- |
+| `open` | 调用方的 `*std.Io.Reader` | reader 必须比 decoder 活得久 | 只释放 decoder 自己的内存 |
+| `openBytes` | `bytes` 切片，**不复制** | `bytes` 必须比 decoder 活得久 | reader 记录（不释放 `bytes`） |
+| `openFile` | `std.Io.File`，64 KiB 流式读缓冲 | file 必须比 decoder 活得久 | 读缓冲 + reader 记录（**不关 file**） |
+| `openFileWithIo` | 同上，但 `Io` 由调用方给 | 同上 | 同上 |
+
 ### 契约
 
 - **输出只有一条路径**：交错 i16。8/16/24/32 位 PCM 和 float32 都在解码器内部转换；播放器不需要按源格式分支。
-- **调用方给缓冲**：`read()` 只在 `out` 里写，不分配；`open()` 是唯一可能使用 allocator 的地方（WAV 不分配，FLAC 按 STREAMINFO 的 max block size 分配一帧 i32 缓冲）。
+- **调用方给缓冲**：`read()` 只在 `out` 里写，不分配；`open()` / `openBytes()` / `openFile*()` 是仅有的可能使用 allocator 的地方（WAV 不分配帧缓冲，FLAC 按 STREAMINFO 的 max block size 分配一帧 i32 缓冲；两个便利入口还会分配 Reader 状态，`openFile*` 另加 64 KiB 读缓冲）。
 - **`read()` 的容量**：能解 `out.len / info.channels` 帧。`out.len` 不是声道数的整数倍时，只解完整帧，尾部 i16 不碰；`out.len == 0` 返回 0；`0 < out.len < channels` 返回 `error.ShortBuffer`。
 - **返回的是写入的 i16 个数**，一定是 `channels` 的整数倍；`0` 表示流结束。
 - **FLAC 的前缀语义**：如果某一帧失败（CRC、截断、32 位 side），此前已经解出的样本会先返回；下一次 `read()` 返回同一个错误。调用方既能拿到合法音频，也能看到具名失败，而不是被“半段静音”糊弄。
 - **声道原样保留**：不做下混、不做上混、不做采样率转换。5.1 就是 6 声道。
-- **reader 生命周期**：`reader` 由调用方持有，必须比 `Decoder` 活得久；`deinit()` 不关闭 reader。
+- **reader / 文件生命周期**：`open` 的 `reader` 由调用方持有；`openBytes` 的 `bytes` 不被复制；`openFile*` 的 `file` 不被关闭。三者都必须比 `Decoder` 活得久，`deinit()` 只释放 decoder 自己分配的东西。
 - **错误后不复用**：`read()` 返回任何错误后，这个 decoder 的状态不再保证，直接 `deinit()`；不要用“再读一次”来探测错误是否消失。
-- **`open()` 会消费流**：读取 12 字节签名并扫描元数据/chunk，直到首个音频帧（WAV 是 `data` 负载，FLAC 是第一帧）起点；失败时也可能已经消费了最多 12 字节（甚至更多头部）。想先判断而不消费，用 `probe()`（需要调用方自己准备那几字节）。
+- **入口会消费流**：`open()` 读取 12 字节签名并扫描元数据/chunk，直到首个音频帧（WAV 是 `data` 负载，FLAC 是第一帧）起点；`openFile*` 用 positional reader 从 offset 0 开始；失败时也可能已经消费了最多 12 字节（甚至更多头部）。想先判断而不消费，用 `probe()`（需要调用方自己准备那几字节）。
 - **错误不吞**：截断、损坏、不支持、I/O 失败分别有具名错误；不使用 `catch {}` 把问题变成静音。
 
 ### PCM 输出规则（逐比特可复现）
@@ -234,10 +368,10 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 
 ## 设计原则
 
-- **流式**：`open()` 只读到首个音频帧起点，`read()` 按调用方的缓冲大小推进；不把整个文件读进内存。
+- **流式**：`open()` 只读到首个音频帧起点，`read()` 按调用方的缓冲大小推进；`openFile()` 用 64 KiB 读缓冲，不把整个文件读进内存。
 - **调用方提供缓冲**：`read()` 没有隐藏分配，也没有内部 PCM 环形缓冲。
-- **无全局状态**：没有单例、没有线程局部缓存、没有全局注册表；两个 decoder 可以并发解不同的流。
-- **无分配（或显式 allocator）**：WAV 解码零分配；FLAC 在 `open()` 用调用方的 allocator 分配**一帧**的 i32 缓冲；`read()` 永远不分配；`deinit()` 释放。
+- **解码器无全局状态**：没有单例、没有线程局部缓存、没有全局注册表；两个 decoder 可以并发解不同的流。唯一的例外是 `openFile()` 这个不带 `Io` 的便利入口——它必须从某处拿到 `Io`，使用的是 std 的 `Threaded.global_single_threaded`（单线程、阻塞）。需要并发、取消或自定义事件循环时，用 `openFileWithIo()` 或 `open()`。
+- **无分配（或显式 allocator）**：WAV 解码零分配；FLAC 在 `open*()` 用调用方的 allocator 分配**一帧**的 i32 缓冲；`read()` 永远不分配；`deinit()` 释放。
 - **显式错误**：`NotAudio` / `Unsupported` / `Truncated` / `Corrupt` / `Io` / `OutOfMemory` / `ShortBuffer`；没有“静音代替错误”。
 - **可 fuzz**：解析器只接受 `[]const u8` 和 `std.Io.Reader`，没有文件系统、线程、时间依赖；`zig build fuzz` 对合法 WAV 和合法 FLAC 各做一半随机变异，断言不 panic、不越界、错误具名。
 
@@ -263,7 +397,7 @@ zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）解�
 ### 目录
 
 ```
-src/root.zig        公共 API（probe / open / Decoder）
+src/root.zig        公共 API（probe / open / openBytes / openFile / Decoder）
 src/types.zig       公共类型（Format / Info / Error）
 src/wav.zig         流式 WAV 解码器
 src/flac.zig        流式 FLAC 解码器
