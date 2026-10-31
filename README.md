@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。
 
 ## FLAC：完整支持
 
@@ -66,6 +66,59 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 `zig build bench` 的 MP3 行有两条：3 秒 44.1 kHz/128 kbps 单声道文件约 900x 实时，
 1 秒 44.1 kHz/128 kbps 立体声文件约 570x 实时（ReleaseFast，两者都远高于 100x 目标）。
 
+## 老格式与 Mac 来源：G.711 / ADPCM / AIFF
+
+这一组格式的共同点是**整数运算、可逐样本校验**。六个 2 秒素材对 ffmpeg `-f s16le` 的 `max_diff` 全部为 0，样本总数完全一致：
+
+| 素材 | 编码 | 样本数 | max_diff |
+| --- | --- | --- | --- |
+| `mulaw-8k.wav` | WAV µ-law 8 kHz 单声道 | 16000 | 0 |
+| `alaw-8k.wav` | WAV A-law 8 kHz 单声道 | 16000 | 0 |
+| `ima-wav-44k.wav` | WAV IMA ADPCM 44.1 kHz 单声道 | 89804 | 0 |
+| `ms-adpcm-44k.wav` | WAV Microsoft ADPCM 44.1 kHz 单声道 | 89584 | 0 |
+| `aiff-s16.aiff` | AIFF PCM16 44.1 kHz 单声道 | 88200 | 0 |
+| `aiff-s24.aiff` | AIFF PCM24 44.1 kHz 单声道 | 88200 | 0 |
+
+### G.711：表在 comptime 生成，不是抄来的常量表
+
+`src/g711.zig` 的 256 项表由 G.711 分段压扩公式在编译期算出，源码里只有公式：
+
+- µ-law：`u = ~code`，`mag = ((((u & 0x0F) << 1) + 33) << ((u >> 4) & 7)) - 33`，输出 `±4 * mag`；
+- A-law：`a = code ^ 0x55`，`seg == 0 ? ((a & 0x0F) << 4) + 8 : (((a & 0x0F) << 4) + 0x108) << (seg - 1)`，符号位为 1 表示正。
+
+两者都是 ITU-T G.711 的参考展开（与 Sun `g711.c` 的算术一致；µ-law 的 13 位幅度乘 4 进入 16 位范围）。测试用 256 个码的符号对称性 `table[code] == -table[code ^ 0x80]` 做全表校验，再对地标码做定点断言（µ-law `0x00 = -32124`、`0x80 = +32124`；A-law `0x2A = -32256`、`0xAA = +32256`）。
+
+### ADPCM：有状态的块解码
+
+- **IMA（tag 0x11）**：每声道 4 字节块头（`predictor: i16`、`step_index: u8`、reserved），数据按 8 个样本一组、每组内每声道 4 字节排列，**低 nibble 在前**。`diff = ((2 * (nibble & 7) + 1) * step) >> 3` 必须**先乘后移**：按参考实现逐项移位会分别截断，再经反馈环累积成几 LSB 的漂移。step index 钳位 0..88，predictor 饱和到 i16，每块独立重置状态。
+- **MS（tag 0x02）**：每声道 7 字节块头，字段按声道交错写（所有 predictor → 所有 delta → 所有 sample1 → 所有 sample2）；输出先 `sample2` 再 `sample1`；nibble 高 4 位在前，且是**二进制补码**（-8..+7），不是 8 偏置。
+- 块参数：MS 的 7 组预测系数**从 `fmt ` 扩展里读**（`cbSize = 32`），不写死；`block_align` 决定每块字节数，`samples_per_block` 由块大小推出（IMA `1 + (block-4ch)/(4ch)*8`，MS `2 + (block-7ch)*2/ch`），`total_frames = 块数 * samples_per_block`。ffmpeg 对 ADPCM 不按 `fact` 裁剪，最后一个块的填充样本照样输出，本库与之一致（所以 IMA 的样本数是 89804 而不是 `fact` 的 88200）。
+- **MS ADPCM 最容易错的地方**：预测器是 `(sample1*coeff1 + sample2*coeff2) / 256` 的**向零截断除法**，不是 `>> 8`——负和时两者差 1。再叠加“nibble 用补码而不是偏置”和“sample1/sample2 的写入顺序”，任何一处错都会被反馈环放大成满量程误差。
+
+### AIFF：80 位扩展浮点采样率
+
+`src/aiff.zig` 读大端 `FORM`/`AIFF`：`COMM` 给声道数、帧数、位深和 80 位 IEEE 754 扩展格式的采样率；`SSND` 前 8 字节是 offset/block size，音频从 `8 + offset` 开始。PCM 8/16/24/32 大端，**8 位是有符号的**（与 WAV 的 128 偏置不同）。
+
+80 位扩展的解析不是查表：值 = `mantissa * 2^(exponent - 16383 - 63)`，尾数带显式整数位。用 u128 做移位和就近舍入，因此 11025、37800、44056、192000 以及任何能放进 `u32` 的整数采样率都能解析；零、负数、NaN/Inf、次正规和超出 `u32` 的值分别有具名错误。
+
+### 本轮明确拒绝
+
+| 拒绝项 | 错误 | 原因 |
+| --- | --- | --- |
+| AIFC（压缩格式，也是 `fl32`/`fl64` 浮点 AIFF 的容器） | `error.Unsupported` | 需要额外的压缩类型字段，本轮不猜 |
+| AIFF 20 位等非字节对齐 PCM | `error.Unsupported` | 只做 8/16/24/32 |
+| AIFF `SSND` 在 `COMM` 之前 | `error.Unsupported` | 流式解码无法回退去重读采样 |
+| WAV GSM 6.10（0x0031）、MP3-in-WAV（0x0055）等其它压缩 tag | `error.Unsupported` | 解码器不内置 |
+| IMA / MS ADPCM 的 2/3/5 位变体 | `error.Unsupported` | 只做 WAV 的 4 位定义 |
+| MS ADPCM 超过 2 声道 | `error.Unsupported` | ffmpeg 的 >2 声道布局是逐声道平面，本轮不做 |
+
+### 测试、fuzz 与 bench
+
+- `src/g711_test.zig` / `src/adpcm_test.zig` / `src/aiff_test.zig`：表地标与全表对称性、手算块（含 IMA 饱和、MS 截断除法与立体声交错）、AIFF 各位深与 80 位浮点边界、具名拒绝；
+- `src/legacy_vectors_test.zig`：六个真文件的 `probe`/`Info`/`total_frames` 与 `max_diff 0` 验收（文件缺失时打印一行并 `SkipZigTest`）；
+- 变异 fuzz 模板从 4 个扩到 10 个（六种新素材全部在列），`zig build fuzz` 10000 轮无 panic；
+- bench 新增 4 行：µ-law 8 kHz、IMA/MS ADPCM 44.1 kHz、AIFF PCM16 44.1 kHz，ReleaseFast 下均远高于 100x 目标（本机约 6.6k–400k× 实时）。
+
 ## 这不是 Zig 版 FFmpeg
 
 这个库只做**一件事**：把一个已经拿到的音频字节流解码成交错 PCM。它不是多媒体框架，也永远不会长成 FFmpeg。
@@ -89,7 +142,7 @@ s16 比 SNR ≥ 70 dB、最大差 ≤ 8 LSB，且每 20 个 granule 一段的 SN
 
 音频不一样：Windows 上 WASAPI 只负责**输出**，系统并不带 FLAC / Opus 解码器；macOS 的 AudioToolbox 对 FLAC 的支持也随版本和容器而变。一个应用如果想“走到哪都能放 FLAC”，最后往往还是得自带解码器。音频格式的专利面也窄得多（FLAC、Opus 都是开放、免专利的），维护成本比视频低一个数量级。
 
-所以这里只做音频：**WAV 已完整，FLAC 子帧集合已完整**（官方 13 个向量全部整文件逐样本对齐），Opus 等后续再评估。
+所以这里只做音频：**WAV 已完整（含 G.711 与两种 ADPCM），AIFF PCM 已支持，FLAC 子帧集合已完整**（官方 13 个向量全部整文件逐样本对齐），Opus 等后续再评估。
 
 ## 用法
 
@@ -261,6 +314,9 @@ while (true) {
 | RIFF/WAVE，PCM 8 位（无符号） | ✅ | 按 WAV 约定 `128 == 静音` |
 | PCM 16 / 24 / 32 位 | ✅ | 24 位取高 16 位，32 位右移 16；输出统一为 i16 |
 | IEEE float 32 位 | ✅ | clamp 到 [-1, 1]，NaN → 0，±inf → 边界值 |
+| PCM µ-law（tag 7）/ A-law（tag 6） | ✅ | ITU-T G.711 表在 comptime 生成，展开为 16 位线性；`bits_per_sample` 报 16 |
+| IMA ADPCM（tag 0x11） | ✅ | 每块独立重置 predictor/step index；8 样本一组、每声道 4 字节；`bits_per_sample` 报 16 |
+| Microsoft ADPCM（tag 0x02） | ✅ | 预测系数从 `fmt ` 扩展读（不写死）；1–2 声道；`bits_per_sample` 报 16 |
 | `WAVE_FORMAT_EXTENSIBLE`（PCM / IEEE_FLOAT 子格式） | ✅ | 校验 16 字节 GUID |
 | 24-in-32（容器 32 位、valid bits 24） | ✅ | 按容器对齐读取，`bits_per_sample` 报 32 |
 | 任意采样率 | ✅ | 不重采样，原样报告 |
@@ -277,16 +333,38 @@ while (true) {
 | --- | --- | --- |
 | `RIFX`（大端 RIFF） | `error.Unsupported` | 只支持 little-endian RIFF |
 | `RF64` | `error.Unsupported` | 64 位长度容器不在当前范围 |
-| `WAVE_FORMAT_ADPCM`（0x0002）、A-law（0x0006）、μ-law（0x0007）、MP3（0x0055）等 | `error.Unsupported` | 压缩/有损格式，解码器不内置 |
+| GSM 6.10（0x0031）、MP3-in-WAV（0x0055）等其它压缩 tag | `error.Unsupported` | 压缩/有损格式，解码器不内置 |
+| IMA / MS ADPCM 的 2/3/5 位变体（`bits != 4`） | `error.Unsupported` | 只做 WAV 的 4 位定义 |
+| MS ADPCM 超过 2 声道 | `error.Unsupported` | ffmpeg 对 >2 声道用逐声道平面布局，本轮不做 |
+| MS ADPCM 系数表为 0 组 / 超过 16 组 / `cbSize` 不足 | `error.Corrupt` / `error.Unsupported` | 头部自相矛盾 / 工程上限 |
 | PCM 12 / 20 位等非字节对齐位深 | `error.Unsupported` | 只支持 8/16/24/32 |
 | IEEE float 64 位 | `error.Unsupported` | 只支持 float32 |
 | `data` 在 `fmt ` 之前 | `error.Unsupported` | 流式解码无法回退去重读 `data`；不猜、不缓冲整个文件 |
 | 超过 64 声道 | `error.Unsupported` | 明确的工程上限，避免帧大小失控 |
-| `block_align` 与声道×位深不一致 | `error.Corrupt` | 头部自相矛盾 |
-| `data` 长度不是整帧 | `error.Corrupt` | 半帧不是有效音频 |
+| PCM 的 `block_align` 与声道×位深不一致 | `error.Corrupt` | 头部自相矛盾 |
+| PCM 的 `data` 长度不是整帧 | `error.Corrupt` | 半帧不是有效音频（ADPCM 允许最后一个块不完整，按实际字节数解码） |
+| ADPCM 的 `block_align` 小于块头 / 数据短于一个块头 | `error.Corrupt` | 块布局自相矛盾，解码不了 |
+| IMA 块头的 step index > 88、MS 块头的 predictor 越界 | `error.Corrupt` | 头部自相矛盾 |
 | `fmt ` 长度 < 16、EXTENSIBLE 的 cbSize < 22、valid bits 越界 | `error.Corrupt` | 头部结构损坏 |
 | 流在头部/数据中途结束 | `error.Truncated` | 不把截断当正常 EOF |
 | 多个 `data` chunk | ⚠️ 只解第一个 | 流式解码在第一个 `data` 结束；后续数据忽略 |
+
+### AIFF：完整支持
+
+| AIFF 变体 | 状态 | 说明 |
+| --- | --- | --- |
+| `FORM`/`AIFF` 容器、`COMM` + `SSND` | ✅ | 大端；未知 chunk 按 AIFF 奇数长度 padding 跳过；重复 `COMM` 忽略后一个 |
+| PCM 8 / 16 / 24 / 32 位 | ✅ | 全部大端；8 位是**有符号**的，与 WAV 的 128 偏置不同 |
+| 任意整数采样率（80 位扩展浮点） | ✅ | u128 解析 `mantissa * 2^(exp - 16383 - 63)`，不查表；小数按就近舍入 |
+| `COMM` 帧数声明 | ✅ | `Info.total_frames` 用声明值；`SSND` 实际字节更少时，读完前缀后返回 `error.Truncated` |
+| `SSND` 的 offset 字段 | ✅ | 跳过 offset 字节再读采样 |
+| `AIFC`（压缩格式，含 `fl32`/`fl64` 浮点） | `error.Unsupported` | 需要解析压缩类型字段，本轮不做 |
+| AIFF 中的 ADPCM（AIFC 的 `ima4` 等） | `error.Unsupported` | 属于 AIFC 压缩类型，同上 |
+| 20 位等非字节对齐 PCM | `error.Unsupported` | 只做 8/16/24/32 |
+| 32 位浮点 AIFF（`fl32`/`fl64`） | `error.Unsupported` | 容器是 AIFC，本轮明确不做 |
+| `SSND` 在 `COMM` 之前 | `error.Unsupported` | 流式解码无法回退去重读采样 |
+| `COMM` < 18 字节、`SSND` < 8 字节、offset 越过 payload | `error.Corrupt` | 头部自相矛盾 |
+| 流在 chunk 中途结束 | `error.Truncated` | 不把截断当正常 EOF |
 
 ### FLAC：明确拒绝（具名错误，不猜）
 
@@ -302,8 +380,10 @@ while (true) {
 
 | 输入开头 | `probe()` | `open()` |
 | --- | --- | --- |
-| `RIFF` … `WAVE` | `.wav` | 尝试按 WAV 打开 |
+| `RIFF` … `WAVE` | `.wav` | 尝试按 WAV 打开（PCM / float / EXTENSIBLE / G.711 / IMA / MS ADPCM） |
 | `fLaC` | `.flac` | 尝试按 FLAC 打开（支持 CONSTANT / VERBATIM / FIXED / LPC + 三种去相关） |
+| `FORM` … `AIFF` | `.aiff` | 尝试按 AIFF 打开（大端 PCM 8/16/24/32） |
+| `FORM` … `AIFC` | `null` | `error.Unsupported` |
 | `RF64` / `RIFX` + `WAVE` | `null` | `error.Unsupported` |
 | 其他 | `null` | `error.NotAudio` |
 
@@ -312,22 +392,23 @@ while (true) {
 ## 公共 API
 
 ```zig
-pub const Format = enum { wav, flac };
+pub const Format = enum { wav, flac, mp3, aiff };
 
 pub const Info = struct {
     format: Format,
     sample_rate: u32,
     channels: u16,
-    bits_per_sample: u16, // 源位深：WAV 报容器位深（float 报 32）；FLAC 报真实位深 4..32
+    bits_per_sample: u16, // 源位深：WAV 报容器位深（float 报 32，G.711/ADPCM 报 16）；
+                          // FLAC 报真实位深 4..32；AIFF 报 COMM 的位数
     total_frames: ?u64,   // 头部声明；流式容器/未知总长时为 null
 };
 
 pub const Error = error{
     NotAudio,    // 不是本库认识的音频签名
-    Unsupported, // 认识但不支持（FLAC 32 位 side 声道、压缩 WAV、RIFX/RF64…）
+    Unsupported, // 认识但不支持（FLAC 32 位 side 声道、AIFC、RIFX/RF64、GSM…）
     Truncated,   // 流在完整头部/帧之前结束
     Corrupt,     // 头部字段自相矛盾、CRC 不符或结构损坏
-    OutOfMemory, // open 时分配失败（WAV 不分配；FLAC 分配一帧缓冲）
+    OutOfMemory, // open 时分配失败（FLAC 分配一帧缓冲；WAV 的 ADPCM 分配一块）
     Io,          // 底层 Reader 报告 ReadFailed；不是格式错误
     ShortBuffer, // 调用方给的输出缓冲比一帧还小
 };
@@ -357,7 +438,7 @@ pub const Decoder = struct {
 ### 契约
 
 - **输出只有一条路径**：交错 i16。8/16/24/32 位 PCM 和 float32 都在解码器内部转换；播放器不需要按源格式分支。
-- **调用方给缓冲**：`read()` 只在 `out` 里写，不分配；`open()` / `openBytes()` / `openFile*()` 是仅有的可能使用 allocator 的地方（WAV 不分配帧缓冲，FLAC 按 STREAMINFO 的 max block size 分配一帧 i32 缓冲；两个便利入口还会分配 Reader 状态，`openFile*` 另加 64 KiB 读缓冲）。
+- **调用方给缓冲**：`read()` 只在 `out` 里写，不分配；`open()` / `openBytes()` / `openFile*()` 是仅有的可能使用 allocator 的地方（WAV 的 PCM/float/G.711 不分配帧缓冲，ADPCM 分配一个压缩块和解码块；FLAC 按 STREAMINFO 的 max block size 分配一帧 i32 缓冲；两个便利入口还会分配 Reader 状态，`openFile*` 另加 64 KiB 读缓冲）。
 - **`read()` 的容量**：能解 `out.len / info.channels` 帧。`out.len` 不是声道数的整数倍时，只解完整帧，尾部 i16 不碰；`out.len == 0` 返回 0；`0 < out.len < channels` 返回 `error.ShortBuffer`。
 - **返回的是写入的 i16 个数**，一定是 `channels` 的整数倍；`0` 表示流结束。
 - **FLAC 的前缀语义**：如果某一帧失败（CRC、截断、32 位 side），此前已经解出的样本会先返回；下一次 `read()` 返回同一个错误。调用方既能拿到合法音频，也能看到具名失败，而不是被“半段静音”糊弄。
@@ -378,6 +459,12 @@ pub const Decoder = struct {
 | WAV 24-bit PCM | 算术右移 8 位（丢低 8 位） | 与 ffmpeg `-f s16le` 一致；不是四舍五入 |
 | WAV 32-bit PCM | 算术右移 16 位（丢低 16 位） | 同上 |
 | WAV float32 | clamp 到 [-1, 1]，NaN → 0，±inf → ±满量程；`round(x * 32768)`，`1.0` → 32767 | float 源的舍入不属于 WAV 格式，允许与其它实现差 1 LSB |
+| WAV µ-law / A-law | 查表展开到 16 位 | ITU-T G.711 comptime 表，逐码精确；`bits_per_sample` 报 16 |
+| WAV IMA / MS ADPCM | 块解码到 16 位 | 每块重置状态；`total_frames` 含末块填充样本，与 ffmpeg 一致 |
+| AIFF 8-bit | `sample << 8`（**有符号**） | 与 FLAC 8 位相同，不是 WAV 的 128 偏置 |
+| AIFF 16-bit | 原样复制（大端读取） | |
+| AIFF 24-bit | 算术右移 8 位 | 取高 16 位 |
+| AIFF 32-bit | 算术右移 16 位 | 取高 16 位 |
 | FLAC 8-bit | `sample << 8`（**有符号**） | 0 → 0，-128 → -32768，127 → 32512；没有 WAV 的 128 偏置 |
 | FLAC 12-bit | `sample << 4` | 12 位源占满 i16 |
 | FLAC 16-bit | 原样复制 | |
@@ -406,9 +493,9 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 - **流式**：`open()` 只读到首个音频帧起点，`read()` 按调用方的缓冲大小推进；`openFile()` 用 64 KiB 读缓冲，不把整个文件读进内存。
 - **调用方提供缓冲**：`read()` 没有隐藏分配，也没有内部 PCM 环形缓冲。
 - **解码器无全局状态**：没有单例、没有线程局部缓存、没有全局注册表；两个 decoder 可以并发解不同的流。唯一的例外是 `openFile()` 这个不带 `Io` 的便利入口——它必须从某处拿到 `Io`，使用的是 std 的 `Threaded.global_single_threaded`（单线程、阻塞）。需要并发、取消或自定义事件循环时，用 `openFileWithIo()` 或 `open()`。
-- **无分配（或显式 allocator）**：WAV 解码零分配；FLAC 在 `open*()` 用调用方的 allocator 分配**一帧**的 i32 缓冲；`read()` 永远不分配；`deinit()` 释放。
+- **无分配（或显式 allocator）**：WAV 的 PCM / float / G.711 路径零分配；WAV 的 ADPCM 在 `open*()` 用调用方的 allocator 分配**一个压缩块 + 一个解码块**；FLAC 在 `open*()` 分配**一帧**的 i32 缓冲；`read()` 永远不分配；`deinit()` 释放。
 - **显式错误**：`NotAudio` / `Unsupported` / `Truncated` / `Corrupt` / `Io` / `OutOfMemory` / `ShortBuffer`；没有“静音代替错误”。
-- **可 fuzz**：解析器只接受 `[]const u8` 和 `std.Io.Reader`，没有文件系统、线程、时间依赖；`zig build fuzz` 对合法 WAV 和合法 FLAC 各做一半随机变异，断言不 panic、不越界、错误具名。
+- **可 fuzz**：解析器只接受 `[]const u8` 和 `std.Io.Reader`，没有文件系统、线程、时间依赖；`zig build fuzz` 对 10 种合法模板（WAV / FLAC / MP3 mono / MP3 stereo / µ-law / A-law / IMA ADPCM / MS ADPCM / AIFF16 / AIFF24）做随机变异，断言不 panic、不越界、错误具名。
 
 ## 构建与测试
 
@@ -416,9 +503,9 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 
 ```sh
 zig build            # 编译库（static lib 到 zig-out/）
-zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz
-zig build fuzz       # 10000 轮变异 fuzz（WAV 与 FLAC 各一半）
-zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）解码基准（ReleaseFast；低于目标会失败）
+zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz（10 种模板）
+zig build fuzz       # 10000 轮变异 fuzz（WAV / FLAC / MP3 / G.711 / ADPCM / AIFF 共 10 种模板）
+zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）、MP3 与老格式解码基准（ReleaseFast；低于目标会失败）
 ```
 
 集成测试会尝试调用本机 ffmpeg（Windows 路径写死为开发机上的位置）；路径不存在或不是 Windows 时测试自动 `SkipZigTest`，CI 不依赖 ffmpeg。
@@ -428,19 +515,23 @@ zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）解�
 - `tools/fetch-vectors.ps1`：把 13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 官方向量下载到 `.zig-cache/vectors/`，逐个做 SHA-256 校验；向量不进 git。向量缺失时 FLAC 测试打印一行说明并 `SkipZigTest`，不会失败。
 - `src/compare.zig`：测试辅助。把本库解出的 i16 与 ffmpeg 的 `-f s16le`、`-f s32le >> 16` 逐样本比较，并支持“截断流的可解前缀”对比（60 号向量的 50% 截断用例）。
 - `src/flac_build.zig`：测试专用的小型 FLAC 编码器，用来造 CONSTANT / VERBATIM / FIXED / LPC、各种位深、块大小扩展、wasted bits、escape code、LPC 精度/阶数/正负 shift，以及 L/S、R/S、M/S 三种去相关声道的精确用例；不参与库代码。
+- `src/legacy_vectors_test.zig`：G.711 / ADPCM / AIFF 六个 2 秒素材对 ffmpeg 的整文件逐样本验收；素材放在仓库外的 `..\zig-audio-vectors\legacy`，缺失时打印一行并 `SkipZigTest`。
 
 ### 目录
 
 ```
 src/root.zig        公共 API（probe / open / openBytes / openFile / Decoder）
 src/types.zig       公共类型（Format / Info / Error）
-src/wav.zig         流式 WAV 解码器
+src/wav.zig         流式 WAV 解码器（PCM / float / G.711 / ADPCM 分派）
+src/g711.zig        ITU-T G.711 µ-law/A-law 表（comptime 生成）
+src/adpcm.zig       IMA / Microsoft ADPCM 块解码与 fmt 扩展解析
+src/aiff.zig        流式 AIFF 解码器（大端 PCM + 80 位扩展采样率）
 src/flac.zig        流式 FLAC 解码器
 src/flac_bits.zig   MSB 位读取 + CRC-8 / CRC-16
 src/flac_meta.zig   STREAMINFO 与元数据块循环
 src/flac_frame.zig  帧头、子帧、Rice 分区、帧尾 CRC
 src/flac_build.zig  测试专用 FLAC 编码器（不进库）
-src/bench.zig       WAV + FLAC 基准程序
+src/bench.zig       WAV + FLAC + MP3 + 老格式基准程序
 src/fuzz.zig        变异 fuzzer（同时作为 1000 轮测试运行）
 src/compare.zig     与 ffmpeg 逐样本比较的测试辅助
 src/fixtures/       提交进仓库的小样本 + 生成命令
