@@ -1,13 +1,14 @@
 //! FLAC frame decoding: header, CrC-8, subframes, Rice residual, CRC-16.
 //!
-//! Stage A covers the independent-channel subset of the format:
+//! Supported subset:
 //!   * subframes: CONSTANT, VERBATIM, FIXED orders 0..4, all Rice partitions
 //!     (including the escape code), wasted bits;
-//!   * channel assignment: independent only (0..7).
+//!   * channel assignment: independent (0..7), left/side (8), right/side (9)
+//!     and mid/side (10).
 //!
-//! LPC subframes and the left/side, right/side and mid/side assignments are
-//! recognized and answered with `error.Unsupported`, never mis-decoded: a
-//! decoder that emits wrong PCM is worse than one that says "not yet".
+//! LPC subframes are recognized and answered with `error.Unsupported`, never
+//! mis-decoded: a decoder that emits wrong PCM is worse than one that says
+//! "not yet".
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -182,13 +183,17 @@ fn readCodedNumber(
 
 /// Decode one frame body into planar i32 samples:
 /// `out[channel * block_size + sample]`.
+///
+/// The subframe loop is shared by independent and decorrelated frames: a side
+/// subframe is simply the one whose bit depth is one higher. Reconstruction
+/// runs after both subframes have been decoded, which is also after
+/// `decodeSubframe` has restored their wasted bits.
 pub fn decode(
     reader: *std.Io.Reader,
     header: Header,
     stream: *const meta.StreamInfo,
     out: []i32,
 ) Error!void {
-    if (!header.isIndependent()) return error.Unsupported;
     if (header.channels() != stream.channels) return error.Corrupt;
     if (header.bits_per_sample != 0 and header.bits_per_sample != stream.bits_per_sample) {
         return error.Corrupt;
@@ -200,15 +205,57 @@ pub fn decode(
     const block_size: usize = header.block_size;
     const channels: usize = stream.channels;
     if (out.len != block_size * channels) return error.Corrupt;
+    const bps = stream.bits_per_sample;
+    const decorrelated = !header.isIndependent();
+    // A side channel is one bit wider than the source. At 32 bps that would be
+    // 33 bits, which neither the i32 frame buffer nor the 32-bit bit reader can
+    // hold; say so instead of truncating the top bit.
+    if (decorrelated and bps >= 32) return error.Unsupported;
+    // right/side stores its side subframe first; the other two store it second.
+    const side_first = decorrelated and header.channel_assignment == 9;
+    const subframes: usize = if (decorrelated) 2 else channels;
 
     var bits = BitReader.init(reader, header.crc16_seed);
-    for (0..channels) |channel| {
+    for (0..subframes) |channel| {
+        const sub_bps = if (decorrelated and (side_first == (channel == 0))) bps + 1 else bps;
         const plane = out[channel * block_size ..][0..block_size];
-        try decodeSubframe(&bits, header.block_size, stream.bits_per_sample, plane);
+        try decodeSubframe(&bits, header.block_size, sub_bps, plane);
     }
     bits.alignToByte();
     const expected = try bits.readFrameCrc16();
     if (bits.crc16 != expected) return error.Corrupt;
+
+    if (decorrelated) {
+        try reconstruct(header.channel_assignment, out[0..block_size], out[block_size..][0..block_size]);
+    }
+}
+
+/// Undo left/side (8), right/side (9) or mid/side (10). The side plane is
+/// `second` for 8 and 10 and `first` for 9; both planes already hold the
+/// restored (wasted-bits-expanded) samples.
+fn reconstruct(assignment: u4, first: []i32, second: []i32) Error!void {
+    switch (assignment) {
+        8 => {
+            // side = left - right, so right = left - side.
+            for (first, second) |l, *r| r.* = try fit(@as(i64, l) - @as(i64, r.*));
+        },
+        9 => {
+            // side = left - right, so left = right + side.
+            for (first, second) |*s, r| s.* = try fit(@as(i64, r) + @as(i64, s.*));
+        },
+        10 => {
+            for (first, second) |*m, *s| {
+                // Restore the sum's low bit from the side channel; without
+                // `(side & 1)` the output is off by one sample value and the
+                // frame CRC still matches.
+                const side: i64 = s.*;
+                const twice: i64 = (@as(i64, m.*) << 1) | (side & 1);
+                m.* = try fit((twice + side) >> 1);
+                s.* = try fit((twice - side) >> 1);
+            }
+        },
+        else => return error.Corrupt, // 11..15 are rejected by readHeader
+    }
 }
 
 fn decodeSubframe(
@@ -242,7 +289,7 @@ fn decodeSubframe(
             if (order > 4) return error.Corrupt;
             try decodeFixed(bits, block_size, effective, order, out);
         },
-        // LPC: deliberately not implemented in Stage A. Answering Unsupported
+        // LPC: deliberately not implemented yet. Answering Unsupported
         // before consuming the subframe is what keeps the error honest.
         32...63 => return error.Unsupported,
         else => return error.Corrupt, // reserved subframe types

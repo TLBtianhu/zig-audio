@@ -1,10 +1,12 @@
 //! Test/bench-only FLAC encoder for small synthetic streams.
 //!
-//! The official vector corpus does not contain a single file that Stage A can
-//! decode end to end (every one is either LPC-coded or uses side channels), so
-//! the exactness tests build their input here instead: STREAMINFO + frames with
+//! The official corpus has a single file that the decoder handles end to end
+//! (`17 - all fixed orders.flac`), which is not enough to pin down bit depths,
+//! wasted bits, block-size extensions or every channel assignment, so the
+//! exactness tests build their input here instead: STREAMINFO + frames with
 //! CONSTANT/VERBATIM/FIXED subframes and real Rice coding, including the escape
-//! code, wasted bits and both block-size extension bytes.
+//! code, wasted bits, both block-size extension bytes and the three
+//! decorrelated channel assignments.
 //!
 //! Not imported by the library; only tests, fuzz and bench use it.
 
@@ -28,7 +30,9 @@ pub const Frame = struct {
     wasted: u5 = 0,
     /// null = "use STREAMINFO"; 13 = write the rate as 16-bit Hz.
     sample_rate_code: ?u4 = null,
-    /// null = independent channels; 8/9/10 craft a decorrelated header.
+    /// null = independent channels; 8/9/10 encode a decorrelated stream, in
+    /// which `samples` must already hold the transformed planes (see
+    /// `subframeBits` for where the side channel sits and how wide it is).
     channel_assignment: ?u4 = null,
     corrupt_header_crc: bool = false,
 };
@@ -155,7 +159,13 @@ fn buildFrame(
     for (frame.modes, 0..) |mode, channel| {
         const samples = frame.samples[channel];
         std.debug.assert(samples.len == frame.block_size);
-        try writeSubframe(&body, frame, mode, samples, spec.bits_per_sample);
+        try writeSubframe(
+            &body,
+            frame,
+            mode,
+            samples,
+            subframeBits(spec.bits_per_sample, assignment, channel),
+        );
     }
     try body.flush();
     try out.appendSlice(allocator, body.bytes.items);
@@ -165,6 +175,18 @@ fn buildFrame(
     try appendU16be(&out, allocator, footer);
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Bit depth of one subframe. The side channel is one bit wider than the
+/// source, and the assignment decides which subframe it is: second for
+/// left/side and mid/side, first for right/side.
+fn subframeBits(bits: u16, assignment: u8, channel: usize) u16 {
+    const is_side = switch (assignment) {
+        8, 10 => channel == 1,
+        9 => channel == 0,
+        else => false,
+    };
+    return bits + @intFromBool(is_side);
 }
 
 fn writeSubframe(
@@ -199,7 +221,7 @@ fn writeSubframe(
             try writeResidual(body, frame, samples, order);
         },
         .lpc => {
-            // Stage A must reject this before reading anything else; the
+            // The decoder must reject this before reading anything else; the
             // subframe header alone is enough to be unambiguous.
             try body.writeBits(0, 1);
             try body.writeBits(0x20, 6); // LPC, order 1

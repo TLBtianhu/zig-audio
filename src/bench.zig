@@ -16,7 +16,7 @@ const seconds: u32 = 10;
 const wav_target_speedup: f64 = 200.0;
 
 /// 0.02 s, 882 frames of a 440 Hz sine, encoded by ffmpeg with fixed
-/// predictors and independent channels (the Stage A subset).
+/// predictors and independent channels (the LPC-free subset).
 const flac_fixture = @embedFile("fixtures/flac-s16-stereo-44100.flac");
 const flac_seconds: f64 = 20.0;
 const flac_target_speedup: f64 = 100.0;

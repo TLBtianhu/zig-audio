@@ -1,9 +1,9 @@
 //! zig-audio: streaming audio decoding in pure Zig.
 //!
-//! v0.2 adds a FLAC decoder covering the independent-channel subset:
-//! CONSTANT, VERBATIM and FIXED(0..4) subframes with Rice partitions. LPC and
-//! the left/side, right/side and mid/side assignments are recognized and
-//! reported as `Unsupported` (see README for the support matrix).
+//! v0.2 adds a FLAC decoder covering CONSTANT, VERBATIM and FIXED(0..4)
+//! subframes with Rice partitions, independent channels and the left/side,
+//! right/side and mid/side channel assignments. LPC subframes are recognized
+//! and reported as `Unsupported` (see README for the support matrix).
 //!
 //! The API deliberately has one output path: interleaved i16. Source PCM
 //! (8/16/24/32) and float32 are converted inside the decoder, so a player

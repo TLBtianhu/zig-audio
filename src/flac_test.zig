@@ -1,6 +1,7 @@
-//! FLAC unit tests. Every stream here is built by `flac_build.zig` because the
-//! official corpus has no end-to-end Stage A file: all 13 vectors are either
-//! LPC-coded or use side channels (see flac_vectors_test.zig for that table).
+//! FLAC unit tests. Every stream here is built by `flac_build.zig`; the
+//! channel-decorrelation cases live in flac_decorrelation_test.zig, and the
+//! official corpus (including `17 - all fixed orders.flac`, which now decodes
+//! end to end) is covered by flac_vectors_test.zig.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -345,34 +346,6 @@ test "LPC subframes are Unsupported, not mis-decoded" {
     defer dec.deinit();
     var out: [64]i16 = undefined;
     try testing.expectError(error.Unsupported, dec.read(&out));
-}
-
-test "decorrelated channel assignments are Unsupported" {
-    const samples = [_]i32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const planes = [_][]const i32{ &samples, &samples };
-
-    for ([_]u4{ 8, 9, 10 }) |assignment| {
-        const frames = [_]build.Frame{.{
-            .block_size = 8,
-            .modes = &.{ .constant, .constant },
-            .samples = &planes,
-            .channel_assignment = assignment,
-        }};
-        const bytes = try build.build(testing.allocator, .{
-            .sample_rate = 44_100,
-            .channels = 2,
-            .bits_per_sample = 16,
-            .total_samples = 8,
-            .frames = &frames,
-        });
-        defer testing.allocator.free(bytes);
-
-        var reader = std.Io.Reader.fixed(bytes);
-        var dec = try openDecoder(&reader);
-        defer dec.deinit();
-        var out: [64]i16 = undefined;
-        try testing.expectError(error.Unsupported, dec.read(&out));
-    }
 }
 
 test "truncation: metadata, frame header and frame body are Truncated" {

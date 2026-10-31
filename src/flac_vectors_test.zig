@@ -4,9 +4,9 @@
 //! `tools/fetch-vectors.ps1` first. When the directory is absent every test
 //! prints one line and skips, so CI stays green without the corpus.
 //!
-//! None of the 13 files is decodable end to end by Stage A: every stereo file
-//! uses left/side, right/side or mid/side, and every independent-channel file
-//! uses LPC. What this file therefore pins down is:
+//! `17 - all fixed orders.flac` now decodes end to end: it is 204 frames of
+//! FIXED subframes using all three decorrelated assignments and no LPC. Every
+//! other file still hits an LPC subframe, so for those this file pins down:
 //!   * metadata parsing (rate / channels / bit depth / total samples / null);
 //!   * the exact number of samples decoded before the first `Unsupported` frame;
 //!   * bit-exact agreement of those prefixes with ffmpeg;
@@ -14,13 +14,13 @@
 //!
 //! Measured vector map (frames, subframe types, channel assignment):
 //!
-//! | file | frames | subframes | channel assign | Stage A prefix |
-//! | ---- | ------ | --------- | -------------- | ------------- |
-//! | 03 - blocksize 16 | 19294 | fixed + 56 lpc | indep 9712 / L/S 2924 / R/S 2263 / M/S 4395 | 2 frames (64 samples) |
+//! | file | frames | subframes | channel assign | decodable prefix |
+//! | ---- | ------ | --------- | -------------- | ---------------- |
+//! | 03 - blocksize 16 | 19294 | fixed + 56 lpc | indep 9712 / L/S 2924 / R/S 2263 / M/S 4395 | 817 frames (26144 samples) |
 //! | 12 - qlp precision 15 bit | 48 | lpc only | L/S 6 / R/S 40 / M/S 2 | 0 |
 //! | 13 - qlp precision 2 bit | 48 | lpc only | L/S 7 / R/S 37 / M/S 4 | 0 |
 //! | 14 - wasted bits | 426 | fixed + lpc (wasted 1..12) | indep 94 / L/S 107 / R/S 203 / M/S 22 | 0 |
-//! | 17 - all fixed orders | 204 | fixed 0..4 only | L/S 55 / R/S 96 / M/S 53 | 0 |
+//! | 17 - all fixed orders | 204 | fixed 0..4 only | L/S 55 / R/S 96 / M/S 53 | **whole file (469028 samples)** |
 //! | 22 - 12 bit per sample | 54 | fixed + lpc | indep 3 / R/S 38 / M/S 13 | 0 |
 //! | 23 - 8 bit per sample | 84 | constant + fixed + lpc | indep 20 / R/S 30 / M/S 34 | 0 |
 //! | 38 - 3 channels (3.0) | 42 | constant + lpc | indep | 0 |
@@ -47,16 +47,17 @@ const Vector = struct {
     bits: u16,
     /// null means STREAMINFO declared 0 ("unknown").
     total_frames: ?u64,
-    /// Samples delivered before the first `Unsupported` frame.
-    prefix_samples: usize,
+    /// Interleaved samples delivered before the first `Unsupported` frame;
+    /// null means the whole file decodes.
+    prefix_samples: ?usize,
 };
 
 const vectors = [_]Vector{
-    .{ .name = "03 - blocksize 16.flac", .channels = 2, .sample_rate = 44_100, .bits = 16, .total_frames = 308_700, .prefix_samples = 64 },
+    .{ .name = "03 - blocksize 16.flac", .channels = 2, .sample_rate = 44_100, .bits = 16, .total_frames = 308_700, .prefix_samples = 26_144 },
     .{ .name = "12 - qlp precision 15 bit.flac", .channels = 2, .sample_rate = 44_100, .bits = 16, .total_frames = 218_644, .prefix_samples = 0 },
     .{ .name = "13 - qlp precision 2 bit.flac", .channels = 2, .sample_rate = 44_100, .bits = 16, .total_frames = 218_498, .prefix_samples = 0 },
     .{ .name = "14 - wasted bits.flac", .channels = 2, .sample_rate = 44_100, .bits = 16, .total_frames = 218_101, .prefix_samples = 0 },
-    .{ .name = "17 - all fixed orders.flac", .channels = 2, .sample_rate = 44_100, .bits = 16, .total_frames = 234_514, .prefix_samples = 0 },
+    .{ .name = "17 - all fixed orders.flac", .channels = 2, .sample_rate = 44_100, .bits = 16, .total_frames = 234_514, .prefix_samples = null },
     .{ .name = "22 - 12 bit per sample.flac", .channels = 2, .sample_rate = 44_100, .bits = 12, .total_frames = 218_666, .prefix_samples = 0 },
     .{ .name = "23 - 8 bit per sample.flac", .channels = 2, .sample_rate = 44_100, .bits = 8, .total_frames = 339_973, .prefix_samples = 0 },
     .{ .name = "38 - 3 channels (3.0).flac", .channels = 3, .sample_rate = 44_100, .bits = 16, .total_frames = 168_210, .prefix_samples = 0 },
@@ -117,14 +118,20 @@ test "official vectors: decodable prefix then Unsupported, never wrong audio" {
         const prefix = try compare.decodePrefix(testing.allocator, bytes);
         defer testing.allocator.free(prefix.samples);
 
-        // Every vector has at least one frame Stage A cannot decode (LPC or a
-        // side-channel assignment), so the prefix is always followed by
-        // Unsupported. A silent EOF here would mean the decoder guessed.
-        try testing.expectEqual(@as(?root.Error, error.Unsupported), prefix.err);
-        try testing.expectEqual(
-            vector.prefix_samples,
-            prefix.samples.len,
-        );
+        if (vector.prefix_samples) |expected| {
+            // Every remaining vector hits an LPC subframe before EOF, so a
+            // silent clean end here would mean the decoder guessed.
+            try testing.expectEqual(@as(?root.Error, error.Unsupported), prefix.err);
+            try testing.expectEqual(expected, prefix.samples.len);
+        } else {
+            // Vector 17 is the end-to-end case: it must reach EOF cleanly and
+            // deliver exactly the declared total.
+            try testing.expectEqual(@as(?root.Error, null), prefix.err);
+            try testing.expectEqual(
+                @as(usize, @intCast(vector.total_frames.?)) * vector.channels,
+                prefix.samples.len,
+            );
+        }
         try testing.expectEqual(
             @as(usize, 0),
             prefix.samples.len % @as(usize, vector.channels),
@@ -133,9 +140,10 @@ test "official vectors: decodable prefix then Unsupported, never wrong audio" {
 }
 
 test "official vectors: decoded prefixes match ffmpeg sample for sample" {
-    // 03, 60, 61 and 64 are the only vectors with a nonzero Stage A prefix.
+    // 03, 60, 61 and 64 have a nonzero prefix; 17 is compared in full below.
     for (vectors) |vector| {
-        if (vector.prefix_samples == 0) continue;
+        const expected = vector.prefix_samples orelse continue;
+        if (expected == 0) continue;
         const bytes = readVector(testing.allocator, vector.name) catch |err| switch (err) {
             error.SkipZigTest => {
                 std.debug.print("flac vectors missing; skipping prefix comparison\n", .{});
@@ -150,8 +158,34 @@ test "official vectors: decoded prefixes match ffmpeg sample for sample" {
             "vector {s}: {d} samples bit-exact vs ffmpeg (max_diff 0)\n",
             .{ vector.name, compared },
         );
-        try testing.expectEqual(vector.prefix_samples, compared);
+        try testing.expectEqual(expected, compared);
     }
+}
+
+test "official vector 17: all fixed orders decodes end to end, bit-exact vs ffmpeg" {
+    const bytes = readVector(testing.allocator, "17 - all fixed orders.flac") catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+    defer testing.allocator.free(bytes);
+
+    var reader = std.Io.Reader.fixed(bytes);
+    var dec = try root.open(testing.allocator, &reader);
+    defer dec.deinit();
+    try testing.expectEqual(@as(u16, 2), dec.info.channels);
+    try testing.expectEqual(@as(?u64, 234_514), dec.info.total_frames);
+
+    // This is the whole-file acceptance test: 234514 frames of FIXED
+    // subframes with L/S + R/S + M/S and no LPC. Only sample-by-sample
+    // comparison can prove mid/side kept the dropped parity bit, because the
+    // frame CRC does not cover the reconstructed PCM.
+    const result = try compare.compareWithFfmpeg(testing.allocator, bytes);
+    std.debug.print(
+        "vector 17: {d} interleaved samples ({d} frames per channel), max_diff {d}\n",
+        .{ result.samples, result.samples / 2, result.max_diff },
+    );
+    try testing.expectEqual(@as(usize, 234_514 * 2), result.samples);
+    try testing.expectEqual(@as(u16, 0), result.max_diff);
 }
 
 test "official vector 45: total_samples == 0 exposes total_frames null" {

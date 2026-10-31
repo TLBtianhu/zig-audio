@@ -88,7 +88,6 @@ pub const Decoder = struct {
         };
 
         const header = try frame.readHeader(self.reader);
-        if (!header.isIndependent()) return error.Unsupported;
         if (header.channels() != self.stream.channels) return error.Corrupt;
         // STREAMINFO declares the largest block in the stream; anything larger
         // is a corrupt header and would also overflow the frame buffer that
