@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zig 0.17.0 is pinned. There is no maintained official setup action for
+      # this version, so the archive is downloaded explicitly; this is the
+      # conservative form that cannot depend on an action's version database.
+      - name: Install Zig 0.17.0 (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64)   triple=x86_64-linux ;;
+            Linux-ARM64) triple=aarch64-linux ;;
+            macOS-X64)   triple=x86_64-macos ;;
+            macOS-ARM64) triple=aarch64-macos ;;
+            *)
+              echo "unsupported runner: ${RUNNER_OS}-${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          archive="zig-${triple}-0.17.0.tar.xz"
+          curl -fsSL --retry 3 "https://ziglang.org/download/0.17.0/${archive}" -o "${archive}"
+          tar -xJf "${archive}"
+          echo "${PWD}/zig-${triple}-0.17.0" >> "${GITHUB_PATH}"
+
+      - name: Install Zig 0.17.0 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = 'zig-x86_64-windows-0.17.0.zip'
+          Invoke-WebRequest -Uri "https://ziglang.org/download/0.17.0/$archive" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath .
+          (Resolve-Path '.\zig-x86_64-windows-0.17.0').Path | Add-Content -Path $env:GITHUB_PATH
+
+      - name: Check Zig version
+        run: zig version
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      - name: Fuzz
+        if: runner.os == 'Linux'
+        run: zig build fuzz

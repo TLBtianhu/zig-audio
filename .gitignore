@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+zig-cache/
+
+# Toolchain archives downloaded by the CI/local setup.
+*.zip
+*.tar.xz
+
+.DS_Store
+Thumbs.db
