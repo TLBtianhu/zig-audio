@@ -749,14 +749,40 @@ zig build fuzz       # 10000 轮变异 fuzz（WAV / FLAC / MP3 / G.711 / ADPCM /
 zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）、MP3 与老格式解码基准（ReleaseFast；低于目标会失败）
 ```
 
-集成测试会尝试调用本机 ffmpeg（Windows 路径写死为开发机上的位置）；路径不存在或不是 Windows 时测试自动 `SkipZigTest`，CI 不依赖 ffmpeg。
+### ffmpeg 配置与发布门
 
-除了实时 ffmpeg 测试，仓库还提交了 **0.02 秒的 ffmpeg 生成音频样本**（`src/fixtures/`，总计约 200 KB）：没有 ffmpeg 的 CI 也能解码真实的 PCM8/16/24/32、float32、5.1 WAV，以及固定预测和 LPC（mono 8 kHz、stereo 44.1 kHz order 32 mid/side）的 FLAC；其中的 stereo LPC 文件还与其同源 WAV 逐样本一致。Opus 侧另有 2 秒 SILK 与 2 秒**纯 Hybrid** 素材，Hybrid 的整文件 ffmpeg 比对不依赖外部语料库。
+实时 ffmpeg 对照只存在于测试和对照工具中，公共库模块不依赖 ffmpeg。路径按以下**严格优先级**解析；高优先级一旦设置，即使路径错误也不会悄悄回退：
 
-- `tools/fetch-vectors.ps1`：把 13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 官方向量下载到 `.zig-cache/vectors/`，逐个做 SHA-256 校验；向量不进 git。向量缺失时 FLAC 测试打印一行说明并 `SkipZigTest`，不会失败。
+1. `ZA_FFMPEG_PATH`：可以是 ffmpeg 可执行文件的完整路径，也可以是包含它的 `bin` 目录；
+2. 仓库根目录的 `ffmpeg.path`：单行路径，规则同上；此文件已加入 `.gitignore`，用于本机配置，不入库；
+3. 原开发机默认路径：仅作为向后兼容的本机便利。
+
+第一次调用会打印 `ffmpeg: source=env|file|default path=...`。找不到可执行文件时，每个受影响用例都会打印名称和 `ffmpeg_unavailable` 原因；ffmpeg 已启动但返回失败则是测试失败，不会伪装成 skip。
+
+测试汇总分为四层：`L1` 纯库、`L2` 仓库内固定小样本、`L3` 外部向量结构/元数据对照、`L4` 实时 ffmpeg 对照。**凡需实时 ffmpeg 的外部向量逐样本用例也归入 L4**。每层打印 `executed=N compared=M skipped=...`；`compared` 是完成参考值/固定向量/ffmpeg 对照的测试数，不是样本数。
+
+开发机默认仍允许 L4 skip，但发布门不允许：
+
+```sh
+# 新机器 / CI 的最小发布门命令（路径换成实际 exe 或 bin 目录）
+ZA_FFMPEG_PATH=/path/to/ffmpeg zig build test -Drequire-ffmpeg=true
+
+# PowerShell
+$env:ZA_FFMPEG_PATH = 'C:\tools\ffmpeg\bin'
+zig build test -Drequire-ffmpeg=true
+
+# 也可用环境变量开启同一道门，不必重新编译选项
+ZA_REQUIRE_FFMPEG=1 zig build test
+```
+
+`-Drequire-ffmpeg=true` 或 `ZA_REQUIRE_FFMPEG=1` 会把**任何 L4 skip 都提升为失败**，逐个打印用例名与原因；这包括 `external_vectors_missing`，所以发布环境还必须准备好下面列出的外部向量。测试运行步骤不重用上一次的环境结果，修改 `ZA_FFMPEG_PATH` 后不会因为构建缓存而沿用“全绿”。
+
+仓库还提交了 **0.02 秒的 ffmpeg 生成音频样本**（`src/fixtures/`，总计约 200 KB）：没有 ffmpeg 的普通开发测试也能解码真实的 PCM8/16/24/32、float32、5.1 WAV，以及固定预测和 LPC（mono 8 kHz、stereo 44.1 kHz order 32 mid/side）的 FLAC；其中的 stereo LPC 文件还与其同源 WAV 逐样本一致。Opus 侧另有 2 秒 SILK 与 2 秒**纯 Hybrid** 素材。
+
+- `tools/fetch-vectors.ps1`：把 13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 官方向量下载到 `.zig-cache/vectors/`，逐个做 SHA-256 校验；向量不进 git。向量缺失时默认打印原因并 `SkipZigTest`；发布门会拒绝涉及 L4 对照的缺失。
 - `src/compare.zig`：测试辅助。把本库解出的 i16 与 ffmpeg 的 `-f s16le`、`-f s32le >> 16` 逐样本比较，并支持“截断流的可解前缀”对比（60 号向量的 50% 截断用例）。
 - `src/flac_build.zig`：测试专用的小型 FLAC 编码器，用来造 CONSTANT / VERBATIM / FIXED / LPC、各种位深、块大小扩展、wasted bits、escape code、LPC 精度/阶数/正负 shift，以及 L/S、R/S、M/S 三种去相关声道的精确用例；不参与库代码。
-- `src/legacy_vectors_test.zig`：G.711 / ADPCM / AIFF 六个 2 秒素材对 ffmpeg 的整文件逐样本验收；素材放在仓库外的 `..\zig-audio-vectors\legacy`，缺失时打印一行并 `SkipZigTest`。
+- `src/legacy_vectors_test.zig`：G.711 / ADPCM / AIFF 六个 2 秒素材对 ffmpeg 的整文件逐样本验收；素材放在仓库外的 `..\zig-audio-vectors\legacy`，缺失时默认打印原因并 `SkipZigTest`，发布门下则失败。
 
 ### 目录
 
@@ -802,6 +828,9 @@ src/ogg_build.zig / vorbis_build.zig / opus_build.zig  测试专用 Ogg 页 / Vo
 src/bench.zig       WAV + FLAC + MP3 + Ogg + 老格式基准程序
 src/fuzz.zig        变异 fuzzer（同时作为 1000 轮测试运行）
 src/compare.zig     与 ffmpeg 逐样本比较的测试辅助
+src/ffmpeg.zig      测试专用 ffmpeg 路径解析、来源审计与进程入口
+src/test_audit.zig  测试分层、skip 原因与 L4 静态归类
+src/test_runner.zig L1-L4 汇总和 require-ffmpeg 发布门
 src/fixtures/       提交进仓库的小样本 + 生成命令
 src/*_test.zig      单元 / API / fixture / ffmpeg 集成测试
 tools/              官方 FLAC 测试向量下载脚本

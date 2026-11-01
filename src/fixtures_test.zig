@@ -217,8 +217,8 @@ test "committed 24-bit FLAC matches ffmpeg -f s32le shifted right by 16" {
 }
 
 test "committed LPC FLAC fixtures match ffmpeg sample for sample" {
-    // Skipped when ffmpeg is absent (non-Windows CI); the offline decode above
-    // and the WAV-source comparison still cover both LPC files there.
+    // Skipped with a named reason when ffmpeg is absent; the offline decode
+    // above and the WAV-source comparison still cover both LPC files there.
     for ([_]usize{ 3, 4 }) |i| {
         try compare.expectExact(testing.allocator, flac_cases[i].bytes);
     }
