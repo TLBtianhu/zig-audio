@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg Vorbis 完整解码**：容器、三个头包、floor 1 / residue 0-1-2 / 逆耦合 / IMDCT / 重叠相加，两个测试向量整文件对 ffmpeg 的 f32 输出 SNR 131.9–133.4 dB（最大差 < 8e-8）、s16 SNR 98.8–101.0 dB（最大 1 LSB），样本数与 granule 完全一致。**Ogg Opus 现在是「容器 + CELT + SILK + Hybrid 解码」**：`OpusHead` / `OpusTags` / 每个包的 TOC 帧结构 / 时长全部可读，且 **CELT 层（configuration 16–31）真的出 PCM**——粗/细能量、比特分配、PVQ、anti-collapse、立体声 theta、IMDCT、重叠相加、音高后滤波、去加重全部实现，三个纯 CELT 测试向量整文件对 ffmpeg `-f f32le` 的 SNR 为 **94.3 / 123.2 / 141.9 dB**（s16 SNR 93.8–105.3 dB，最大 1–2 LSB），样本数与 `granule − pre-skip` 完全一致。**SILK 层（configuration 0–11）也真的出 PCM**：VAD/LBRR、增益、LSF→LPC、音高/LTP、shell 激励、再白化、LPC 合成，以及 SILK 特有的 8/12/16→48 kHz 重采样全部实现，纯 SILK 测试向量整文件对 ffmpeg `-f f32le` 的 SNR 为 **145.3 dB**（s16 107.3 dB，最大 1 LSB），样本数与 `granule − pre-skip` 完全一致。**Hybrid（configuration 12–15）也真的出 PCM**：SILK 低频带与 CELT 高频带在同一帧上分别解码、在时域相加，两个混合素材（9 / 10 个 Hybrid 包，夹在 SILK 与 CELT 包之间）整文件对 ffmpeg `-f f32le` 的 SNR 为 **141.9 / 145.4 dB**（s16 105.9 / 106.1 dB，最大 1 LSB），样本数与 `granule − pre-skip` 完全一致；**立体声 Hybrid 仍是 `error.Unsupported`**（没有素材，不写没测过的路径）。floor 0 未支持。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg Vorbis 完整解码**：容器、三个头包、floor 1 / residue 0-1-2 / 逆耦合 / IMDCT / 重叠相加，两个测试向量整文件对 ffmpeg 的 f32 输出 SNR 131.9–133.4 dB（最大差 < 8e-8）、s16 SNR 98.8–101.0 dB（最大 1 LSB），样本数与 granule 完全一致。**Ogg Opus 现在是「容器 + CELT + SILK + Hybrid 解码」**：`OpusHead` / `OpusTags` / 每个包的 TOC 帧结构 / 时长全部可读，且 **CELT 层（configuration 16–31）真的出 PCM**——粗/细能量、比特分配、PVQ、anti-collapse、立体声 theta、IMDCT、重叠相加、音高后滤波、去加重全部实现，三个纯 CELT 测试向量整文件对 ffmpeg `-f f32le` 的 SNR 为 **140.7 / 140.4 / 141.9 dB**（s16 SNR 102.6–105.3 dB，最大 1 LSB），样本数与 `granule − pre-skip` 完全一致。**SILK 层（configuration 0–11）也真的出 PCM**：VAD/LBRR、增益、LSF→LPC、音高/LTP、shell 激励、再白化、LPC 合成，以及 SILK 特有的 8/12/16→48 kHz 重采样全部实现，纯 SILK 测试向量整文件对 ffmpeg `-f f32le` 的 SNR 为 **145.3 dB**（s16 107.3 dB，最大 1 LSB），样本数与 `granule − pre-skip` 完全一致。**Hybrid（configuration 12–15）也真的出 PCM**：SILK 低频带与 CELT 高频带在同一帧上分别解码、在时域相加，两个混合素材（9 / 10 个 Hybrid 包，夹在 SILK 与 CELT 包之间）整文件对 ffmpeg `-f f32le` 的 SNR 为 **141.9 / 145.4 dB**（s16 105.9 / 106.1 dB，最大 1 LSB），样本数与 `granule − pre-skip` 完全一致；**立体声 SILK / Hybrid 也已打通**，整文件 SNR **144.8 / 139.1 dB**（s16 106.8 / 103.8 dB，最大 1 LSB）。floor 0 未支持。
 
 
 ## FLAC：完整支持
@@ -136,7 +136,7 @@ Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，�
 | **CELT 解码（config 16–31）** | ✅ | 粗能量（frame 级 inter/intra 预测）→ 细能量 → 比特分配 → PVQ 形状 → anti-collapse → 反归一化 → 立体声 theta 重建 → IMDCT → 重叠相加 → 音高后滤波 → 去加重 |
 | **SILK 解码（config 0–11）** | ✅ | VAD/LBRR → 增益（绝对+差分）→ LSF（stage-1/2 VQ、反预测、稳定化、LSF→LPC）→ 音高（lag+contour）→ LTP → 激励（pulse/shell、LSB、符号、伪随机翻转）→ 再白化 → LTP 合成 → LPC 合成 → 限幅 → 8/12/16→48 kHz 重采样 |
 | **Hybrid 解码（config 12–15）** | ✅ | 一帧内 SILK 占前半段比特、CELT 从 `tell()` 处接着解；CELT 起始频带 17（≈8 kHz）、终止频带按包带宽（SWB 19 / FB 21）；SILK 半边固定按 WB 16 kHz 合成再升 48 kHz，两路**时域相加**；包尾 ≥37 比特时读模式切换的 CELT 冗余帧并做 2.5 ms crossfade |
-| **立体声 SILK / Hybrid** | ✅（边界帧达不到 f32 目标） | SILK 的立体声是 **mid/side**（RFC 6716 §4.2.2 的三组预测权 + `silk_stereo_MS_to_LR`），不是两路独立 SILK；Hybrid 立体声 = SILK 的 mid/side 解成 L/R 后**逐声道**升 48 kHz，再加 CELT 自己的立体声，两路分别相加。整文件 SNR：`stereo-silk-24k` 82.91 dB、`stereo-hybrid-32k` 47.05 dB，中间帧 139–145 dB，误差集中在 **transient 帧**（CELT anti-collapse 只在 transient 帧跑），见下面「已知差距」 |
+| **立体声 SILK / Hybrid** | ✅ | SILK 的立体声是 **mid/side**（RFC 6716 §4.2.2 的三组预测权 + `silk_stereo_MS_to_LR`），不是两路独立 SILK；Hybrid 立体声 = SILK 的 mid/side 解成 L/R 后**逐声道**升 48 kHz，再加 CELT 自己的立体声，两路分别相加。整文件 SNR：`stereo-silk-24k` **144.83 dB**、`stereo-hybrid-32k` **139.08 dB**（s16 106.8 / 103.8 dB，最大 1 LSB）。原先两端 transient 帧掉到 20–55 dB，是本轮关掉的两个 CELT 解码错误，见下面「已修复」 |
 | 每包 3 帧及以上（`code 3`） | ❌ `error.Unsupported` | 多帧打包这一轮不做；只解第一帧等于悄悄丢音频，所以明确拒绝 |
 | `open` / PCM | ✅ | 返回可读 PCM 的 `Decoder`；`opus.inspect` 仍提供纯结构视图 |
 
@@ -156,13 +156,13 @@ Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，�
 
 | 素材 | 声道 | 帧数 | f32 SNR | f32 最大差 | s16 SNR | s16 最大差 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `opus-48k-128-20ms.opus` | 2 | 96000 | **94.25 dB** | 4.9e-05 | **93.84 dB** | 2 LSB |
-| `opus-48k-96.opus` | 2 | 144000 | **123.16 dB** | 1.6e-06 | **101.14 dB** | 1 LSB |
+| `opus-48k-128-20ms.opus` | 2 | 96000 | **140.69 dB** | 2.98e-08 | **104.91 dB** | 1 LSB |
+| `opus-48k-96.opus` | 2 | 144000 | **140.42 dB** | 2.98e-08 | **102.63 dB** | 1 LSB |
 | `opus-48k-mono.opus` | 1 | 144000 | **141.91 dB** | 3.7e-08 | **105.25 dB** | 1 LSB |
 
 判据（与 MP3/Vorbis 一致）：f32 SNR ≥ 90 dB 且逐样本最大差 < 1e-4；s16 SNR ≥ 70 dB 且最大差 ≤ 8 LSB；样本数与 ffmpeg 完全一致。三个文件全部通过，**样本数 96000 / 144000 / 144000，与 ffmpeg 逐样本数相同**。
 
-为什么 128k 那个只有 94 dB 而不是 120+：**两个参考实现自己就对不上**。同一份 ffmpeg 里，原生 CELT 解码器和它静态链接的 libopus 在这些文件上相差只有 **77.0 / 77.0 / 80.0 dB**（`opus_celt_vectors_test.zig` 里逐文件测出来并断言“我们比 libopus 更接近 ffmpeg”）。原因是 libopus 的 `FLOAT_APPROX` 构建用多项式近似 `celt_exp2`，而 ffmpeg 原生解码器用 `exp2f`，两者在 `denormalise_bands` 里差出约 1e-4 的相对增益，正好是 77 dB 量级。**所以本轮刻意用精确的 `exp2`**：这既是 RFC 的语义，也是比较目标的实现方式。剩下的 128k 差距来自一个具体位置——最后一个 20 ms 帧里有一个频带的 side 符号（`inv`）两个参考实现判得相反：libopus 与我们一致，ffmpeg 原生相反；那一小段（190 个样本）之外我们对 ffmpeg 的最大差是 **1.5e-08**，就是 f32 噪声。
+为什么 128k / 96k 两个纯 CELT 文件以前只有 94 / 123 dB：**那两处 CELT 解码错误**（折叠区间端点、anti-collapse 声道顺序）只在 transient 帧、并且只在零脉冲频带落到折叠边界时可见，坏帧被 99 个好帧平均掉了；本轮修掉后三个文件都在 140 dB 附近（见下面「已修复」）。另一方面，**两个参考实现自己就对不上**：同一份 ffmpeg 里，原生 CELT 解码器和它静态链接的 libopus 在这些文件上只差 **77.0 / 77.0 / 80.0 dB**（`opus_celt_vectors_test.zig` 里逐文件测出来并断言“我们比 libopus 更接近 ffmpeg”）。原因是 libopus 的 `FLOAT_APPROX` 构建用多项式近似 `celt_exp2`，而 ffmpeg 原生解码器用 `exp2f`，两者在 `denormalise_bands` 里差出约 1e-4 的相对增益，正好是 77 dB 量级。**所以本轮刻意用精确的 `exp2`**：这既是 RFC 的语义，也是比较目标的实现方式。剩下的差（约 4e-8）就是两种浮点求值顺序的舍入。
 
 **pre-skip 对齐结论：裁剪，不是偏移。** ffmpeg `-f f32le` / `-f s16le` 的输出长度恰好是 `granule − pre_skip` = 96000 / 144000，也就是说它把前 312 个样本**丢掉**了，而不是在时间轴上平移。本库做同一件事：解码器算出 `skipped + delivered`，前 `pre_skip` 个样本直接丢，再在末页 granule 处截断（`delivered >= total_frames` 就停）。如果改成“偏移”，整条流会晚 312 个样本 = 6.5 ms，逐样本比对立刻从 141 dB 掉到 0 dB。**末尾还要截断**：包内样本数求和的 96960/144960 比真实长度多出正好一个包（960），末页 granule 把它切掉——这一条和 Vorbis 不同，Vorbis 只截块，Opus 还要按 granule 裁到精确样本数。
 
@@ -213,12 +213,17 @@ SILK 是预测编码：一个短时 LPC 滤波器 + 一个长时（音高）预�
 | `silk-12k-nb.opus` | 101 包全是 config 9 = **SILK WB 20 ms**（名字里的 nb 是码率标签，不是带宽） | 96000 | **145.30 dB** | 2.98e-08 | **107.28 dB** | 1 LSB |
 | `silk-10k-nb.opus` | 101 包全是 config 1 = **SILK NB 20 ms**（8 kHz 内部率，测 flush） | 96000 | **144.33 dB** | 2.98e-08 | **107.72 dB** | 1 LSB |
 | `silk-14k-nb-40ms.opus` | 51 包全是 config 2 = **SILK NB 40 ms**（每包两个 SILK 帧，测 flush） | 96000 | **144.39 dB** | 2.98e-08 | **107.19 dB** | 1 LSB |
-| `stereo-silk-24k.opus` | 91 包 config 9（**SILK WB 20 ms，TOC stereo=1**）+ 1 包 config 13 + 9 包 config 15 | 96000×2 | 82.91 dB ❌ | 5.94e-04 | 82.78 dB | 20 LSB |
-| `stereo-hybrid-32k.opus` | 101 包全是 config 15 = **Hybrid FB 20 ms，stereo=1** | 96000×2 | 47.05 dB ❌ | 4.00e-02 | 47.05 dB | 1310 LSB |
+| `stereo-silk-24k.opus` | 91 包 config 9（**SILK WB 20 ms，TOC stereo=1**）+ 1 包 config 13 + 9 包 config 15 | 96000×2 | **144.83 dB** | 4.47e-08 | **106.76 dB** | 1 LSB |
+| `stereo-hybrid-32k.opus` | 101 包全是 config 15 = **Hybrid FB 20 ms，stereo=1** | 96000×2 | **139.08 dB** | 4.47e-08 | **103.80 dB** | 1 LSB |
 
 145 dB 不是"勉强过 90 dB"，而是**和比较目标是同一套浮点运算**：SILK 的参数解码是定点（增益、LSF、音高、激励），合成是浮点，ffmpeg 的原生 SILK 也是这个分工。libopus 是全定点合成，两者在同样码流上只差约 40 dB，所以"照 libopus 写"会得到正确但和目标差 40 dB 的输出。
 
-**已知差距（这一轮没关掉）：立体声素材的 transient 帧。** 两个立体声素材的误差**不在** SILK、也不在 mid/side：把统计按包切开，中间 98 个 Hybrid 包分别是 145.1 dB / 133.3 dB（左/右），**只有两端那两三个包掉到 20–40 dB**。继续切下去，坏包与 `read()` 里的 **transient（短块）帧**一一对应——`opus.inspect` 看不到它，要在 CELT 解码里打点：`stereo-hybrid-32k.opus` 的 101 帧里只有 2 帧 `is_transient`，正好是首包与末包；纯 CELT 的 `opus-48k-128-20ms.opus` 也是 2 帧，其中末包就是 73.6 dB 那一个（其余 140 dB，所以整文件仍过 90 dB）。也就是说这是 **CELT 短块路径里一个早就存在、只是没有素材踩到的 bug**，不是这一轮加立体声引入的；transient 帧在全部素材里只有 42 帧 / 1525 帧，且**每个 transient 帧都带 `anti_collapse_on=1`**，而 anti-collapse 是唯一"只在 transient 帧跑"且会**注入伪随机噪声**的步骤——所以下一个该查的是 anti-collapse 的噪声幅度/序列（`r`、`thresh`、seed 来源都已逐项对过 libopus 与 ffmpeg，剩下的是循环顺序与 `prev_energy` 的代际）。在这些帧修好之前，`zig build test` 里这两个立体声素材的判据按**实测值**记录（82.91 / 47.05 dB），代码注释里写明"bar 是 90 dB、这里达不到"，不把判据悄悄放松。
+**已修复（本轮）：立体声素材的 transient 帧。** 原先两个立体声素材的首/尾 transient 帧掉到 20–55 dB（整文件 82.91 / 47.05 dB），根因是 **CELT 解码的两个错误叠加**，都不在 SILK、也不在 mid/side：
+
+1. **`quant_all_bands` 的折叠区间端点少算了一位。** libopus 与 ffmpeg 的 `fold_start` 都是先自减再比较（`while (eBands[--fold_start] > target)`），这样“恰好等于 `effective_lowband` 的那个频带”本身可折叠；原来的写法比较的是前一个频带，循环停下时没有把该频带包含进来。`fold_end` 的包含性同样错了一位。于是 `x_cm`（可折叠频带的 collapse mask 并集）取错，零脉冲频带的 `fill`、以及写回的 `collapse_masks` 都跟着错。此外 `collapse_masks` 原来没有逐帧清零（ffmpeg 每帧 `memset`）；折叠区间错时它还会把上一帧的掩码读进来，让错值更不可预测。这一条主要打中立体声 / 混合帧：Hybrid 的 `effective_lowband` 总被钳到 `e_bands[17]`，正好落在频带边界上，所以每个 Hybrid 帧都在 band 18–20 命中；单声道素材修复前后都是 141.9 dB，没有踩到这条。
+2. **anti-collapse 的循环嵌套。** ffmpeg 是 **channel-major**（每声道调用一次 `process_anticollapse`，两个声道共享 `f->seed`），libopus 是 band-major / channel-inner；这里原来照 libopus 写。噪声幅度 `r`、`prev_energy` 的两代历史、seed 来源都与 ffmpeg 逐位一致（用带 `fprintf` 的本地 ffmpeg 调试版逐频带对过），只有 LCG 序列分配给哪个 (band, channel) 不同——对 42 个 transient 帧里 `r > 0` 的那些，这决定了注入噪声的符号。既然验收目标是 ffmpeg，这里改成 channel-major。
+
+修好后 `stereo-silk-24k` / `stereo-hybrid-32k` 整文件 **144.83 / 139.08 dB**（s16 106.76 / 103.80 dB，最大 1 LSB），交付的每一包都 ≥ 137.7 dB；两个文件回到 90 dB 判据，不再按实测值记录。**为什么能躲过之前的 1525 帧素材**：transient 帧只有 42/1525，anti-collapse 只在那里跑；而折叠端点的错误只在“频带零脉冲 + 折叠边界恰好落在频带边界”时可见，纯 CELT 素材里只有最后一个低码率帧满足；128k 那个文件整文件仍有 94.25 dB（其余 100 帧 140 dB），所以一直过线。
 **素材实况**：任务给的三个"SILK 素材"里只有一个是纯 SILK，另两个是混合模式。Hybrid 做完之后它们都能整文件解码，所以三个文件现在都是验收素材（混合那两个的完整数字在下面「Hybrid」一节）：
 
 | 素材 | config 分布 | 第一个包 | 现在 |
