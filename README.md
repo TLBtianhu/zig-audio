@@ -4,7 +4,7 @@
 
 **一句话定位**：当 Zig 应用想在不依赖 C、不依赖系统、流式、可 fuzz 的前提下解码几种常见音频格式时，它应该是第一个被想到的库。
 
-> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg Vorbis 完整解码**：容器、三个头包、floor 1 / residue 0-1-2 / 逆耦合 / IMDCT / 重叠相加，两个测试向量整文件对 ffmpeg 的 f32 输出 SNR 131.9–133.4 dB（最大差 < 8e-8）、s16 SNR 98.8–101.0 dB（最大 1 LSB），样本数与 granule 完全一致。**Ogg Opus 现在是「容器 + CELT 解码」**：`OpusHead` / `OpusTags` / 每个包的 TOC 帧结构 / 时长全部可读，且 **CELT 层（configuration 16–31）真的出 PCM**——粗/细能量、比特分配、PVQ、anti-collapse、立体声 theta、IMDCT、重叠相加、音高后滤波、去加重全部实现，三个纯 CELT 测试向量整文件对 ffmpeg `-f f32le` 的 SNR 为 **94.3 / 123.2 / 141.9 dB**（s16 SNR 93.8–105.3 dB，最大 1–2 LSB），样本数与 `granule − pre-skip` 完全一致。**SILK 与 Hybrid（configuration 0–15）仍未实现**：遇到这类包 `read()` 返回 `error.Unsupported`，不伪造静音、也不只解 Hybrid 里的 CELT 部分。floor 0 未支持。
+> 状态：WAV（PCM / IEEE float / EXTENSIBLE）完整支持，另加 G.711 µ-law/A-law、IMA ADPCM、Microsoft ADPCM；AIFF（大端 PCM 8/16/24/32）支持；FLAC 子帧集合完整支持：CONSTANT / VERBATIM / FIXED(0–4) / **LPC(1–32 阶)** + Rice 分区、wasted bits、independent 声道，以及 left/side、right/side、mid/side 三种声道去相关。官方 13 个测试向量**全部整文件解码**，与 ffmpeg 逐样本 `max_diff 0`。MP3（MPEG-1 Layer III）支持**单声道 + 立体声 + 联合立体声（mid/side、intensity）**：八个测试向量（32/44.1/48 kHz，CBR 与 VBR，含 40.9 秒真实音乐）整文件对 ffmpeg 的 f32 输出 SNR 118.9–124.0 dB、逐 granule 最大绝对差 < 2e-6，s16 最大 1 LSB，含 short/start/stop 窗口切换与逐帧开关的 joint stereo，见下文。**Ogg Vorbis 完整解码**：容器、三个头包、floor 1 / residue 0-1-2 / 逆耦合 / IMDCT / 重叠相加，两个测试向量整文件对 ffmpeg 的 f32 输出 SNR 131.9–133.4 dB（最大差 < 8e-8）、s16 SNR 98.8–101.0 dB（最大 1 LSB），样本数与 granule 完全一致。**Ogg Opus 现在是「容器 + CELT + SILK 解码」**：`OpusHead` / `OpusTags` / 每个包的 TOC 帧结构 / 时长全部可读，且 **CELT 层（configuration 16–31）真的出 PCM**——粗/细能量、比特分配、PVQ、anti-collapse、立体声 theta、IMDCT、重叠相加、音高后滤波、去加重全部实现，三个纯 CELT 测试向量整文件对 ffmpeg `-f f32le` 的 SNR 为 **94.3 / 123.2 / 141.9 dB**（s16 SNR 93.8–105.3 dB，最大 1–2 LSB），样本数与 `granule − pre-skip` 完全一致。**SILK 层（configuration 0–11）也真的出 PCM**：VAD/LBRR、增益、LSF→LPC、音高/LTP、shell 激励、再白化、LPC 合成，以及 SILK 特有的 8/12/16→48 kHz 重采样全部实现，纯 SILK 测试向量整文件对 ffmpeg `-f f32le` 的 SNR 为 **145.3 dB**（s16 107.3 dB，最大 1 LSB），样本数与 `granule − pre-skip` 完全一致。**Hybrid（configuration 12–15）仍未实现**：它要 SILK 与 CELT 同时跑再混合，所以整帧返回 `error.Unsupported`，不伪造静音、也不只解其中一层。floor 0 未支持。
 
 
 ## FLAC：完整支持
@@ -120,9 +120,9 @@ Ogg 容器 + Vorbis I **整条解码链**：三个头包、audio packet、floor 
 
 ffprobe 只暴露声道、采样率和时长（正好对上 `total_frames`）；码本 / floor / residue / mode 的数量用一个独立的 Python 参考解析器按 Vorbis I 规范交叉核对。坏 CRC（页体翻一字节）→ `error.Corrupt`；截断（页体切 5 字节）→ `error.Truncated`，两者都在 `read` 阶段报出（`open` 只读头几页，这是流式解码的应有行为）。
 
-### Ogg Opus：容器 + CELT 解码
+### Ogg Opus：容器 + CELT + SILK 解码
 
-Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，逐包决定用哪一层。这一轮做完了 **CELT 层（configuration 16–31）**，也就是 128 kbps 以上的音乐几乎必然走的那条路；SILK 与 Hybrid（0–15）留到下一轮。
+Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，逐包决定用哪一层。这一轮把 **SILK 层（configuration 0–11，也就是语音）也做完了**，接在上一轮的 CELT 层（16–31）旁边：纯 SILK 包与纯 CELT 包都能出 PCM，**Hybrid（12–15，两层同时跑）仍然返回 `error.Unsupported`**。SILK 与 CELT 共用同一套范围解码器、同一个 pre-skip/granule 裁剪路径，区别是 SILK 在 8/12/16 kHz 上合成，再重采样到 48 kHz。
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
@@ -134,8 +134,8 @@ Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，�
 | TOC 帧结构（RFC 6716 §3.2） | ✅ | config / stereo / frame count code 0–3、1–2 字节帧长、padding、每帧大小与偏移 |
 | `Info.total_frames` | ✅ | `最后一页 granule − pre_skip`；**granule 含 pre-skip**；与前几轮一样，`open` 时是 `null`，`read` 到 EOF 后填上 |
 | **CELT 解码（config 16–31）** | ✅ | 粗能量（frame 级 inter/intra 预测）→ 细能量 → 比特分配 → PVQ 形状 → anti-collapse → 反归一化 → 立体声 theta 重建 → IMDCT → 重叠相加 → 音高后滤波 → 去加重 |
-| SILK-only（config 0–11） | ❌ `error.Unsupported` | `read()` 在第一个 SILK 包上就拒绝；不伪造静音 |
-| Hybrid（config 12–15） | ❌ `error.Unsupported` | 只解其中 CELT 部分会把 0–8 kHz 丢掉，所以整帧拒绝，不做“半帧正确”的输出 |
+| **SILK 解码（config 0–11）** | ✅ | VAD/LBRR → 增益（绝对+差分）→ LSF（stage-1/2 VQ、反预测、稳定化、LSF→LPC）→ 音高（lag+contour）→ LTP → 激励（pulse/shell、LSB、符号、伪随机翻转）→ 再白化 → LTP 合成 → LPC 合成 → 限幅 → 8/12/16→48 kHz 重采样 |
+| Hybrid（config 12–15） | ❌ `error.Unsupported` | SILK 与 CELT 必须在同一帧上同时跑再混合；只解一层等于丢掉语音带或音乐带，所以整帧拒绝，不做“半帧正确”的输出 |
 | 每包 3 帧及以上（`code 3`） | ❌ `error.Unsupported` | 多帧打包这一轮不做；只解第一帧等于悄悄丢音频，所以明确拒绝 |
 | `open` / PCM | ✅ | 返回可读 PCM 的 `Decoder`；`opus.inspect` 仍提供纯结构视图 |
 
@@ -144,7 +144,7 @@ Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，�
 | 素材 | 声道 | pre_skip | input_rate | gain | family | total_frames | granule（= ffprobe `duration_ts`） | 包数 | 帧/包 | 配置分布 | 本轮可解码 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `opus-48k-128-20ms.opus` | 2 | 312 | 48000 | 0 | 0 | 96000 | 96312 | 101 | 1 | 31 ×101 | ✅ |
-| `opus-48k-24-voip.opus` | 1 | 312 | 48000 | 0 | 0 | 96000 | 96312 | 101 | 1 | 9 ×11, 15 ×9, 23 ×80, 27 ×1 | ❌ SILK/Hybrid |
+| `opus-48k-24-voip.opus` | 1 | 312 | 48000 | 0 | 0 | 96000 | 96312 | 101 | 1 | 9 ×11, 15 ×9, 23 ×80, 27 ×1 | ❌ 第 1 个包是 Hybrid |
 | `opus-48k-64-60ms.opus` | 2 | 312 | 48000 | 0 | 0 | 96000 | 96312 | 34 | 3 | 27 ×31, 31 ×3 | ❌ 3 帧/包 |
 | `opus-48k-96.opus` | 2 | 312 | 48000 | 0 | 0 | 144000 | 144312 | 151 | 1 | 31 ×151 | ✅ |
 | `opus-48k-mono.opus` | 1 | 312 | 48000 | 0 | 0 | 144000 | 144312 | 151 | 1 | 31 ×151 | ✅ |
@@ -186,6 +186,61 @@ Opus 不是一个编码器：它是 **SILK + CELT 两层加一个切换器**，�
 合成用例覆盖真实素材没有的分支：`code 1`（两帧等长）、`code 2`（显式帧长，1 字节与 2 字节两种）、`code 3` 的 CBR/VBR、1 字节与多字节（255 续读）padding、`M=0`、120 ms 上限（48×2.5 ms 通过、49×2.5 ms 拒绝）、超过 1275 字节的帧、以及 `OpusHeaX` 式的坏 magic / 坏版本 / 零声道。真实素材里没有 padding，也没有 `code 1/2`，所以这几条只能靠合成包。
 
 CELT 的单元测试按层拆开：PVQ（`V(N,K)` 手算值、`cwrsi` 把 18 个码字恰好枚举一次、脉冲阶梯与 `bits2pulses` 的往返）、能量反量化、比特分配（分配总量不超预算、caps 随声道数单调）、比特精确的 `bitexact_cos`/`isqrt32`、IMDCT（单频点、FFT 峰值位置、尺寸分解）、Hadamard 与 haar 往返、`stereo_merge`。整文件验收在 `src/opus_celt_vectors_test.zig`。
+
+#### SILK：voice 那一半
+
+SILK 是预测编码：一个短时 LPC 滤波器 + 一个长时（音高）预测器，用稀疏脉冲激励驱动。解码顺序是规范的一部分（RFC 6716 §4.2.3–4.2.7），因为每个字段都改变下一个字段要花多少比特：
+
+1. **帧头**：每个 20 ms 帧的 VAD 标志，然后一个 LBRR 标志；40/60 ms 包再跟一个 LBRR 位图；
+2. **LBRR 帧**（低码率冗余）：只解比特、不合成——它描述的是更早一帧的副本；
+3. **帧类型**：inactive / unvoiced / voiced + 量化偏移（`qoffset_high`）；
+4. **增益**：每 5 ms 子帧一个，首子帧绝对编码（6 位对数），其余差分编码；
+5. **LSF**：stage-1 索引选出码本与预测权重，stage-2 残差反向后向预测 → 归一化 LSF → 稳定化（最小间距、必要时排序推开）→ LSF→LSP→两个多项式→LPC，再做带宽扩展与 LEVINSON 稳定检查；
+6. **音高**：绝对 lag 或相对上一帧的 delta，加 contour 偏移；LTP 五抽头；
+7. **激励**：shell 块脉冲计数（含 17 逃逸与 LSB 扩展）、PVQ 二叉树定位、raw LSB、符号、伪随机符号翻转，装配成 Q23；
+8. **合成**：系数变化处先**再白化**（把输出跑一遍新滤波器得到残差）、按增益比 `rescale`、LTP、LPC、`±1` 限幅；
+9. **重采样**：8/12/16 kHz → 48 kHz，然后交给和 CELT 完全相同的输出路径（pre-skip 裁剪 + 末页 granule 截断）。
+
+**为什么重采样这一步必须"复刻"而不是"写个好滤波器"**：ffmpeg 原生 Opus 解码器的 SILK 输出是 8/12/16 kHz，它用 `libswresample` 升到 48 kHz（`libavcodec/opus/dec.c` 里 `filter_size=16`、按带宽设输入率、先用几个零样本预热、每包调一次 `swr_convert`）。同一份 SILK 码流，用 libopus 自己的 `silk_resampler` 和用 swresample 差 **47 dB**——比"两个解码器"的差别大得多。所以 `src/opus_silk_resample.zig` 复刻的是 swresample 在该配置下的算术：16 抽头/相位、Kaiser 窗 β=9、cutoff 0.97、按精确有理比取相位数（48/8=6、48/12=4、48/16=3，而不是默认的 1024）、`index/frac` 定点步进、以及启动时"镜像"补历史的那段。预热零样本数按带宽取 4/8/11（NB/MB/WB）。这套东西本身用一个独立探针和 `ffmpeg -af aresample=filter_size=16` 对过：8/12/16 kHz 三个速率上都是 **~144 dB、最大差 9e-8**（就是 f32 舍入）。
+
+**验收（对 `ffmpeg -f f32le` / `-f s16le`）**：
+
+| 素材 | 实际内容 | 帧数 | f32 SNR | f32 max | s16 SNR | s16 max |
+| --- | --- | --- | --- | --- | --- | --- |
+| `silk-12k-nb.opus` | 101 包全是 config 9 = **SILK WB 20 ms**（名字里的 nb 是码率标签，不是带宽） | 96000 | **145.30 dB** | 2.98e-08 | **107.28 dB** | 1 LSB |
+
+145 dB 不是"勉强过 90 dB"，而是**和比较目标是同一套浮点运算**：SILK 的参数解码是定点（增益、LSF、音高、激励），合成是浮点，ffmpeg 的原生 SILK 也是这个分工。libopus 是全定点合成，两者在同样码流上只差约 40 dB，所以"照 libopus 写"会得到正确但和目标差 40 dB 的输出。
+
+**素材实况（这一轮必须说清的一件事）**：任务给的两个"SILK 素材"里只有一个是纯 SILK。`opus.inspect` 的真实分布是：
+
+| 素材 | config 分布 | 第一个包 | 纯 SILK？ |
+| --- | --- | --- | --- |
+| `silk-12k-nb.opus` | 9 ×101 | SILK | ✅（而且是 **WB**，不是 NB） |
+| `silk-20k-wb.opus` | 9 ×91, 13 ×1, 15 ×9 | **Hybrid（config 15）** | ❌ 91 个 SILK + 10 个 Hybrid |
+| `opus-48k-24-voip.opus` | 9 ×11, 15 ×9, 23 ×80, 27 ×1 | **Hybrid（config 15）** | ❌ 11 个 SILK + 9 个 Hybrid + 81 个 CELT |
+
+所以第二个素材**没有"两个 SILK 素材都 ≥90 dB"这回事**：它开头 9 个包是 Hybrid，纯 SILK 解码器在**第 1 个包**上就必须拒绝，输出 0 个样本（这正是"混合文件"的诚实形态——不是"解出一半"，而是"从第一个解不了的包起就不猜"）。`opus-48k-24-voip.opus` 也一样：SILK 包在后面，前面 9 个 Hybrid 挡着。为了让 NB/MB 与 40/60 ms 分支也有验收，本轮另外用 libopus 编了几条**纯 SILK** 素材（本地，不入库）交叉验证：
+
+| 本地素材 | config | 帧数 | f32 SNR |
+| --- | --- | --- | --- |
+| `gen-x7000-0.opus`（8 kbps NB 20 ms） | 1 | 96000 | 40.13 dB（见下） |
+| `gen-x11000-6000.opus`（11 kbps MB 20 ms） | 5 | 96000 | **144.18 dB** |
+| `gen-mb40.opus`（NB 40 ms，2 个 SILK 帧） | 2 | 96000 | 46.02 dB（见下） |
+| `gen-wb60.opus`（WB 60 ms，3 个 SILK 帧） | 11 | 96000 | **144.66 dB** |
+
+**NB 的 40 dB 是 ffmpeg 的尾巴，不是我们的**：两条 8 kHz 素材的差异**只在最后 24 个样本**（第 95976..96000 个），前面的子帧全是 143–145 dB。原因是 swresample 在 8 kHz 这条路径上每个包少产几个样本（x86 构建会故意扣住 7 个样本防 SIMD 越读），累计的 `delayed_samples` 最后用 `resample_flush` 补——而 flush 是**镜像**最后几个输入样本凑出来的，不是真信号。ffmpeg 自己把这段镜像出来的尾巴也算进了输出（granule 截断在它之后），我们要复刻就得连 swresample 的 flush 一起抄。这里没有抄：我们给的是真实延续（和 libopus 的尾巴形状一致，只有 ffmpeg 那段是平的）。所以 8 kHz 素材的整文件 SNR 被这 24 个样本拉到 40 dB，而**验收用的 WB/MB 素材不受影响**。
+
+**SILK 的坑（按出现顺序）**：
+
+* **`nlsf_interp_factor` 忘了存回解码器**：`lpc.decode` 把插值因子作为返回值交出来，而合成读的是 `self.interp_factor`。结果 20 ms 帧的前两个子帧（用插值 lead-in）完全正确、后两个子帧用错分支——症状极其有迷惑性：第一个包 145 dB、第二个包从第 2 个子帧起掉到 13 dB，随后的包慢慢"自愈"到 100 dB。这类"字段既是返回值又是状态"的移植错误只有逐子帧 SNR 才看得出来。
+* **输出的 −2 偏移**：参考实现取的是 `frame.output[SILK_HISTORY − flength − 2]`，比"刚写的那一帧"早 2 个样本。这不是笔误，是一个真实的 2 样本提前量；照直觉写成 `−flength` 会让整条流晚 2 个样本，SNR 直接从 145 dB 掉到 ~25 dB。
+* **10 ms MB 的 shell 块多出 8 个样本**：`shell_blocks[MB][10ms] = 8` → 128 个激励样本，而这一帧只有 120 个样本。多出来的 8 个是**编在比特流里的**（要照读），只是合成用不到。第一版在这里加了 `assert(samples == flength)`，fuzz 一跑就炸——参考实现根本没这个约束。
+* **定点溢出在 Zig 里是 panic，在 C 里是回绕**：`silk_lsf2lpc` 的 `ROUND_MULL`、`pol[j] += …`、`nlsf[k] = …`（int16 截断）都依赖回绕。全部换成 `*%`/`+%`/`-%` 与 `@truncate` 之后，10000 轮变异 fuzz 才干净。
+* **激励的符号概率是三维表**：`excitation_sign[active + voiced][qoffset_high][min(pulsecount, 6)]`。把 `active+voiced` 写成 `voiced` 时，pkt0（unvoiced）照样 145 dB，因为 unvoiced 的索引恰好也合法——只有 voiced 帧会错，而且错得"像那么回事"。
+* **LTP 的再白化与 rescale**：`out_end` 与 `scale` 的分支（`i<2 || interp==4`）决定"从哪开始把输出反滤波成残差"和"用不用 LTP scale"；`out_end != 0` 时还要把上一子帧的残差按 `gain[i-1]/gain[i]` 缩放。少任何一半，增益突变的帧就会整体响度差 20%。
+* **Hybrid 一律拒绝**：SILK 包尾若剩下 ≥17 比特，那段是 CELT 冗余帧（RFC 6716 §4.2.3 的模式切换用）。只解 SILK 半边等于丢掉帧尾，所以 `read()` 返回 `error.Unsupported`，不静音、不半帧。
+* **立体声 SILK**：`opus_silk.zig` 里有 unmix（mid/side → L/R），但这一轮**没有验收素材**，所以 `opus.zig` 里对 `stereo` 标志的 SILK 包仍然返回 `error.Unsupported`。写通了但没测过的路径不进默认分支——这比"看起来支持"诚实。
+
 
 
 ## 老格式与 Mac 来源：G.711 / ADPCM / AIFF
@@ -241,8 +296,8 @@ CELT 的单元测试按层拆开：PVQ（`V(N,K)` 手算值、`cwrsi` 把 18 个
 - `src/vorbis_huffman_test.zig` / `vorbis_floor_test.zig` / `vorbis_residue_test.zig` / `vorbis_dsp_test.zig`：规范里那张 8 码字示例表的逐码字回读、稀疏与单码字码本、截断/不可达码、trie 深码、X 列表整表排序（曲线形状回归）、`render_point` 整数插值、dB 表单调性、residue 三种格式的样本落点、IMDCT 对直接余弦和、四种窗形与重叠相加；
 - `src/vorbis_decode_test.zig`：两个 Ogg/Vorbis 真文件**整文件**对 ffmpeg 的 f32 与 s16 输出，逐样本 SNR / 最大差 / 样本数，以及 `ShortBuffer` 与 granule 截断；
 - `src/opus_test.zig` / `src/opus_vectors_test.zig`：`OpusHead` 各字段与 family 0/1、坏 magic/版本/零声道/坏 mapping 的具名错误、32 个 TOC config 与边界 0/11/12/15/16/31、`code 0/1/2/3`、1 字节与 2 字节帧长、1 字节与多字节 padding、120 ms 上限、1275 字节上限；五个真文件与 ffprobe 的 `duration_ts`/`channels`/`sample_rate` 对齐，并逐个包核对「帧大小 + framing + padding == 包长」；
-- 变异 fuzz 模板从 4 个扩到 12 个（六种老格式素材、Ogg/Vorbis 与 Ogg/Opus 全部在列；Ogg 模板真的走完整条解码链，Ogg-Opus 模板既走完整条 CELT 解码链、又单独喂给 `opus.inspect`），`zig build fuzz` 10000 轮无 panic（本轮 625 万样本、1616 次 Opus 结构解析，5184 次成功 open 里包含真实 CELT 解码）；
-- bench 共 12 行：本轮新增 **Opus 128k 立体声（CELT 全链）约 309x 实时**，Ogg Vorbis q4 立体声约 380x，其余老格式行 6.6k–400k× 实时，均远高于 100x 目标。
+- 变异 fuzz 模板从 4 个扩到 12 个（六种老格式素材、Ogg/Vorbis 与 Ogg/Opus 全部在列；Ogg 模板真的走完整条解码链，Ogg-Opus 模板既走完整条 CELT 解码链、又单独喂给 `opus.inspect`；Opus 模板这一轮加了第三个包 **SILK NB 40 ms**，让 SILK 的 8 kHz/两帧路径也吃到变异），`zig build fuzz` 10000 轮无 panic（本轮 624 万样本、1617 次 Opus 结构解析；SILK 定点路径的回绕/截断问题就是这一步逼出来的）；
+- bench 共 13 行：本轮新增 **Opus 12k 单声道（SILK 全链 + 重采样）约 1194x 实时**，上一轮的 Opus 128k 立体声（CELT 全链）约 281x，Ogg Vorbis q4 立体声约 380x，其余老格式行 6.6k–400k× 实时，均远高于 100x 目标。
 
 ## 这不是 Zig 版 FFmpeg
 
@@ -523,12 +578,12 @@ while (true) {
 | `FORM` … `AIFF` | `.aiff` | 尝试按 AIFF 打开（大端 PCM 8/16/24/32） |
 | `FORM` … `AIFC` | `null` | `error.Unsupported` |
 | `OggS` + 首包 `\x01vorbis`（需要 ≥ 36 字节才能看到首包魔数） | `.ogg_vorbis` | 解析 Ogg + Vorbis 头后返回可读 PCM 的 `Decoder` |
-| `OggS` + 首包 `OpusHead`（同样需要 ≥ 36 字节） | `.ogg_opus` | 解析 Ogg + `OpusHead`/`OpusTags` 后返回 `Decoder`；纯 CELT 包出 PCM，SILK/Hybrid 包在 `read()` 上 `error.Unsupported` |
+| `OggS` + 首包 `OpusHead`（同样需要 ≥ 36 字节） | `.ogg_opus` | 解析 Ogg + `OpusHead`/`OpusTags` 后返回 `Decoder`；纯 CELT 与纯 SILK 包都出 PCM，Hybrid 包在 `read()` 上 `error.Unsupported` |
 | `OggS` + 其它/未知逻辑流 | `null` | `error.Unsupported` |
 | `RF64` / `RIFX` + `WAVE` | `null` | `error.Unsupported` |
 | 其他 | `null` | `error.NotAudio` |
 
-`probe()` 宁可返回 `null` 也不把“看起来像”的东西当成可解码格式。`.ogg_opus` 是一个已识别、且**部分可解码**的格式：`probe` 如实报出容器与编码器，`open` 返回真正会解码的 `Decoder`，但 SILK/Hybrid 包在 `read()` 上明确返回 `error.Unsupported`——打开成功不代表每条包都能解，因为包的编码模式写在包里。`open()` 也不接受 `probe()` 不会返回的格式。
+`probe()` 宁可返回 `null` 也不把“看起来像”的东西当成可解码格式。`.ogg_opus` 是一个已识别、且**部分可解码**的格式：`probe` 如实报出容器与编码器，`open` 返回真正会解码的 `Decoder`，纯 CELT 与纯 SILK 包出 PCM，Hybrid 包在 `read()` 上明确返回 `error.Unsupported`——打开成功不代表每条包都能解，因为包的编码模式写在包里。`open()` 也不接受 `probe()` 不会返回的格式。
 
 ## 公共 API
 
@@ -690,6 +745,13 @@ src/opus_celt_frame.zig   立体声重建与逐帧频带循环（§4.3.4.4、§4
 src/opus_celt_post.zig    anti-collapse 与反归一化（§4.3.5、§4.3.6）
 src/opus_celt_dsp.zig     IMDCT（混合基 FFT）、重叠相加、音高后滤波、去加重（§4.3.7）
 src/opus_celt.zig     一帧的符号顺序与状态（§4.3、Table 56）
+src/opus_silk.zig    SILK 一帧的符号顺序与状态（§4.2）：帧头、LBRR、增益、LSF、音高、激励、再白化 + LTP + LPC 合成
+src/opus_silk_lpc.zig  LSF→LPC：stage-2 反预测、稳定化、LSP→多项式→LPC、带宽扩展与稳定性检查
+src/opus_silk_types.zig  SILK 的每声道状态（LSF/LPC/增益/lag/两段历史）与带宽定义
+src/opus_silk_resample.zig  8/12/16 kHz → 48 kHz，复刻 libswresample 在该配置下的多相滤波与流式缓冲
+src/opus_silk_tables_cdf.zig      SILK 的算术模型（RFC 6716 §4.2 的 35 张 CDF 表）
+src/opus_silk_tables_lsf.zig      LSF 码本、权重、排序、cos 表
+src/opus_silk_tables_pitch.zig    音高/LTP/激励/立体声表
 src/ogg_build.zig / vorbis_build.zig / opus_build.zig  测试专用 Ogg 页 / Vorbis 头 / Opus 头与包的写入器（不进库）
 src/bench.zig       WAV + FLAC + MP3 + Ogg + 老格式基准程序
 src/fuzz.zig        变异 fuzzer（同时作为 1000 轮测试运行）
@@ -702,3 +764,6 @@ tools/              官方 FLAC 测试向量下载脚本
 ## License
 
 MIT，见 [LICENSE](LICENSE)。作者：TLBtianhu。
+
+
+
