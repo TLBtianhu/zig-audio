@@ -341,7 +341,9 @@ Hybrid（config 12–15）是 Opus 最后一块：**同一帧里 SILK 编低频�
 - `src/opus_test.zig` / `src/opus_vectors_test.zig`：`OpusHead` 各字段与 family 0/1、坏 magic/版本/零声道/坏 mapping 的具名错误、32 个 TOC config 与边界 0/11/12/15/16/31、`code 0/1/2/3`、1 字节与 2 字节帧长、1 字节与多字节 padding、120 ms 上限、1275 字节上限；五个真文件与 ffprobe 的 `duration_ts`/`channels`/`sample_rate` 对齐，并逐个包核对「帧大小 + framing + padding == 包长」；
 - `src/opus_hybrid_vectors_test.zig`：Hybrid 的验收——两个混合素材与入库的纯 Hybrid fixture 整文件对 ffmpeg（f32/s16、样本数），两个素材的 config 直方图逐项钉死（防止某天素材悄悄少了 Hybrid 包还"通过"），10 ms Hybrid 收尾包单独测，以及"立体声 OpusHead + 单声道 Hybrid 包必须 `error.Unsupported`"（顺手把被改坏的首页 CRC 重算，因为容器层校验它）；`src/opus_hybrid.zig` 里另有窗表与两个 crossfade 方向的单元测试；
 - 变异 fuzz 模板从 4 个扩到 12 个（六种老格式素材、Ogg/Vorbis 与 Ogg/Opus 全部在列；Ogg 模板真的走完整条解码链，Ogg-Opus 模板既走完整条解码链、又单独喂给 `opus.inspect`；Opus 模板现在有五个包：CELT、SILK WB 10 ms 双帧、**SILK NB 40 ms**、**Hybrid FB 20 ms** 与 **Hybrid SWB 10 ms**，让 SILK 的 8 kHz/两帧路径和 Hybrid 的共享范围解码器都吃到变异），`zig build fuzz` 10000 轮无 panic（本轮 619 万样本、1619 次 Opus 结构解析；SILK 定点路径的回绕/截断问题就是这一步逼出来的）；
-- bench 共 14 行：本轮新增 **Opus 32k 单声道（Hybrid，两层同帧 + 时域相加）约 535x 实时**，Opus 12k 单声道（SILK 全链 + 重采样）约 1289x，Opus 128k 立体声（CELT 全链）约 272x，Ogg Vorbis q4 立体声约 470x，其余老格式行 4.8k–330k× 实时，均远高于 100x 目标。
+- bench 共 14 行：本轮新增 **Opus 32k 单声道（Hybrid，两层同帧 + 时域相加）约 535x 实时**，Opus 12k 单声道（SILK 全链 + 重采样）约 1289x，Opus 128k 立体声（CELT 全链）约 272x，Ogg Vorbis q4 立体声约 470x，其余老格式行 4.8k–330k× 实时，均远高于 100x 目标；
+- **永久回归语料** `src/fuzz_corpus/`：20 个最小化样本（Ogg lace/packet 5、Opus TOC 4、FLAC bit reader 3、AIFF 大端长度 4、ADPCM 块边界 4），每个都有 `corpus.json` 条目写明构造与**预期错误/阶段**；`src/fuzz_corpus_test.zig`（L1）逐样本断言错误名、出错阶段、输入长度上限、峰值分配 ≤ 同族有效基线、`deinit` 零泄漏。`src/fuzz_corpus_gen.zig` 可从结构化 builder 重新生成全部 `.bin`。反向证明：把任一 `expected_error` 改错一个名字，`zig build test` 必红；
+- **分配/峰值/并发表**：`zig build bench` 在吞吐行之后按格式输出 `open_allocs / open_bytes / read_allocs / read_bytes / steady_allocs / peak_bytes / samples_per_sec`（构建模式 `ReleaseFast`、CPU 型号、输入 fixture、8192 i16 读缓冲、输出格式都打印在表头）。`read` 的 steady-state 分配实测为 0；Vorbis/Opus 的包前瞻只发生在首次 read（实测 1–3 次）。并发段同时打开 8 种解码器交错读，逐样本与单独解码完全一致，并报告并发峰值字节。
 
 ## 这不是 Zig 版 FFmpeg
 

@@ -1,0 +1,226 @@
+{
+  "version": 1,
+  "note": "Permanent regression corpus for zig-audio. Every sample is built by src/fuzz_corpus_gen.zig, embedded into the test binary with @embedFile, and replayed by src/fuzz_corpus_test.zig. `stage` says where the expected error must appear: open = root.open must return it; read = root.open must succeed and the first failing read must return it.",
+  "samples": [
+    {
+      "name": "ogg_bos_continued",
+      "family": "ogg",
+      "file": "ogg_bos_continued.bin",
+      "stage": "open",
+      "expected_error": "Corrupt",
+      "input_bytes": 47,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Ogg lace/packet class)",
+      "construction": "A structurally valid BOS page (correct CRC, one 19-byte OpusHead lace) with the continued flag set. A BOS page may not continue a previous page.",
+      "symptom": "none observed; locks the BOS/continued contradiction at the first page"
+    },
+    {
+      "name": "ogg_page_body_short",
+      "family": "ogg",
+      "file": "ogg_page_body_short.bin",
+      "stage": "open",
+      "expected_error": "Truncated",
+      "input_bytes": 39,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Ogg lace/packet class)",
+      "construction": "Page header with segment_count=2 and laces {10,20}, but only ten body bytes follow. The body read must stop at EOF, not loop.",
+      "symptom": "none observed; locks the lace-sum versus body-length boundary"
+    },
+    {
+      "name": "ogg_page_crc",
+      "family": "ogg",
+      "file": "ogg_page_crc.bin",
+      "stage": "open",
+      "expected_error": "Corrupt",
+      "input_bytes": 47,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Ogg lace/packet class)",
+      "construction": "A valid single-lace OpusHead BOS page whose stored CRC is 0xDEADBEEF instead of the Ogg CRC-32 of the page.",
+      "symptom": "none observed; the CRC check stays mandatory on every page"
+    },
+    {
+      "name": "ogg_eof_mid_packet",
+      "family": "ogg",
+      "file": "ogg_eof_mid_packet.bin",
+      "stage": "read",
+      "expected_error": "Truncated",
+      "input_bytes": 390,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Ogg lace/packet class)",
+      "construction": "A complete Opus head page and tags page, then a final EOS page containing one 255-byte lace and no terminating lace below 255. The packet is still open when the physical stream ends.",
+      "symptom": "none observed; locks packet continuation across page and EOF"
+    },
+    {
+      "name": "ogg_sequence_gap",
+      "family": "ogg",
+      "file": "ogg_sequence_gap.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 136,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Ogg lace/packet class)",
+      "construction": "Head page sequence 0, tags page sequence 1, audio page sequence 3. The packet is valid but one page is missing.",
+      "symptom": "none observed; a skipped page is not silently accepted"
+    },
+    {
+      "name": "opus_toc_one_byte",
+      "family": "opus_toc",
+      "file": "opus_toc_one_byte.bin",
+      "stage": "read",
+      "expected_error": "Truncated",
+      "input_bytes": 136,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Opus TOC class)",
+      "construction": "A valid Ogg Opus file whose only audio packet is the single byte 0x03: frame count code 3 requires at least two bytes.",
+      "symptom": "none observed; locks RFC 6716 [R6,R7] on the shortest possible packet"
+    },
+    {
+      "name": "opus_toc_code1_odd",
+      "family": "opus_toc",
+      "file": "opus_toc_code1_odd.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 137,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Opus TOC class)",
+      "construction": "TOC 0x01 (code 1, two CBR frames) plus one payload byte. N-1 must be even.",
+      "symptom": "none observed; locks [R3] parity"
+    },
+    {
+      "name": "opus_toc_count_zero",
+      "family": "opus_toc",
+      "file": "opus_toc_count_zero.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 137,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Opus TOC class)",
+      "construction": "TOC 0x03 plus a frame-count byte of 0. At least one frame is required.",
+      "symptom": "none observed; locks the zero-frame count"
+    },
+    {
+      "name": "opus_toc_too_long",
+      "family": "opus_toc",
+      "file": "opus_toc_too_long.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 137,
+      "source": "constructed by src/fuzz_corpus_gen.zig (Opus TOC class)",
+      "construction": "TOC 0x03, config 0 (SILK NB 10 ms = 480 samples), frame count 13. 13 * 480 = 6240 > the 5760-sample / 120 ms cap.",
+      "symptom": "none observed; locks [R5] at the exact first count above the boundary"
+    },
+    {
+      "name": "flac_frame_truncated",
+      "family": "flac_bits",
+      "file": "flac_frame_truncated.bin",
+      "stage": "read",
+      "expected_error": "Truncated",
+      "input_bytes": 50,
+      "source": "constructed by src/fuzz_corpus_gen.zig (FLAC bit-reader class)",
+      "construction": "A valid 44.1 kHz mono 16-bit FLAC with one 32-sample CONSTANT frame, truncated by four bytes: the frame header is intact and the bit reader hits EOF before the footer.",
+      "symptom": "none observed; locks the valid-prefix-then-Truncated rule"
+    },
+    {
+      "name": "flac_header_truncated",
+      "family": "flac_bits",
+      "file": "flac_header_truncated.bin",
+      "stage": "read",
+      "expected_error": "Truncated",
+      "input_bytes": 45,
+      "source": "constructed by src/fuzz_corpus_gen.zig (FLAC bit-reader class)",
+      "construction": "The same FLAC truncated three bytes into the frame header, after the sync code but before the coded number and header CRC.",
+      "symptom": "none observed; locks byte-at-a-time header reads at EOF"
+    },
+    {
+      "name": "flac_wasted_overrun",
+      "family": "flac_bits",
+      "file": "flac_wasted_overrun.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 54,
+      "source": "constructed by src/fuzz_corpus_gen.zig (FLAC bit-reader class)",
+      "construction": "A valid frame header followed by a subframe byte 0x01 (pad 0, CONSTANT, wasted-bits flag 1) and four zero bytes. readUnary(31) reaches 32 zero bits and must return Corrupt instead of scanning to the 24-bit protection limit.",
+      "symptom": "none observed; locks the wasted-bits unary cap and proves the cap is below any unbounded scan"
+    },
+    {
+      "name": "aiff_comm_short",
+      "family": "aiff",
+      "file": "aiff_comm_short.bin",
+      "stage": "open",
+      "expected_error": "Corrupt",
+      "input_bytes": 32,
+      "source": "constructed by src/fuzz_corpus_gen.zig (AIFF big-endian length class)",
+      "construction": "FORM/AIFF with a COMM chunk whose big-endian size field is 12, below the 18-byte minimum.",
+      "symptom": "none observed; a short COMM is not read past its declared size"
+    },
+    {
+      "name": "aiff_negative_rate",
+      "family": "aiff",
+      "file": "aiff_negative_rate.bin",
+      "stage": "open",
+      "expected_error": "Corrupt",
+      "input_bytes": 58,
+      "source": "constructed by src/fuzz_corpus_gen.zig (AIFF big-endian length class)",
+      "construction": "A valid COMM with the sign bit of the 80-bit extended sample rate set, plus a 4-byte SSND payload.",
+      "symptom": "none observed; a negative rate is named, not clamped to zero"
+    },
+    {
+      "name": "aiff_frames_exceed_ssnd",
+      "family": "aiff",
+      "file": "aiff_frames_exceed_ssnd.bin",
+      "stage": "read",
+      "expected_error": "Truncated",
+      "input_bytes": 58,
+      "source": "constructed by src/fuzz_corpus_gen.zig (AIFF big-endian length class)",
+      "construction": "COMM declares 100 frames of mono 16-bit, but SSND carries only four payload bytes (two frames) after its 8-byte offset/block header. The first read returns two frames, the next names Truncated.",
+      "symptom": "none observed; locks COMM frame count versus SSND byte length"
+    },
+    {
+      "name": "aiff_ssnd_before_comm",
+      "family": "aiff",
+      "file": "aiff_ssnd_before_comm.bin",
+      "stage": "open",
+      "expected_error": "Unsupported",
+      "input_bytes": 54,
+      "source": "constructed by src/fuzz_corpus_gen.zig (AIFF big-endian length class)",
+      "construction": "SSND before COMM. A streaming decoder cannot rewind to the samples after learning the channel count and frame size.",
+      "symptom": "none observed; the refusal stays named instead of guessing"
+    },
+    {
+      "name": "adpcm_ima_step89",
+      "family": "adpcm",
+      "file": "adpcm_ima_step89.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 112,
+      "source": "constructed by src/fuzz_corpus_gen.zig (ADPCM block-boundary class)",
+      "construction": "A two-block IMA ADPCM WAV (block_align 32). The first block header stores step_index 89; the table has 89 entries, indices 0..88.",
+      "symptom": "none observed; the one-past-the-end step index is rejected before the table read"
+    },
+    {
+      "name": "adpcm_ima_short_tail",
+      "family": "adpcm",
+      "file": "adpcm_ima_short_tail.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 84,
+      "source": "constructed by src/fuzz_corpus_gen.zig (ADPCM block-boundary class)",
+      "construction": "block_align 32 with a data payload of 35 bytes: one full block plus a three-byte tail shorter than the four-byte IMA header.",
+      "symptom": "none observed; a short final block is Corrupt when the data size is declared, not silent EOF"
+    },
+    {
+      "name": "adpcm_ms_bad_predictor",
+      "family": "adpcm",
+      "file": "adpcm_ms_bad_predictor.bin",
+      "stage": "read",
+      "expected_error": "Corrupt",
+      "input_bytes": 142,
+      "source": "constructed by src/fuzz_corpus_gen.zig (ADPCM block-boundary class)",
+      "construction": "Microsoft ADPCM with the standard seven coefficient pairs; the first block header's predictor index is 7, one past the last valid index 6.",
+      "symptom": "none observed; the coefficient table is indexed only after the range check"
+    },
+    {
+      "name": "adpcm_ms_block_align_short",
+      "family": "adpcm",
+      "file": "adpcm_ms_block_align_short.bin",
+      "stage": "open",
+      "expected_error": "Corrupt",
+      "input_bytes": 90,
+      "source": "constructed by src/fuzz_corpus_gen.zig (ADPCM block-boundary class)",
+      "construction": "A mono Microsoft ADPCM WAV with block_align 6, below the seven-byte per-channel block header.",
+      "symptom": "none observed; block_align is checked against the header size before any allocation"
+    }
+  ]
+}
