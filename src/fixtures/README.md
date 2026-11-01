@@ -1,8 +1,11 @@
 # Test fixtures
 
 Generated locally with **ffmpeg n7.1.5** (20260731 build). They are committed
-because they are tiny (about 110 KB total) and let CI exercise real encoder
-output without installing ffmpeg.
+because they are tiny (about 200 KB total) and let CI exercise real encoder
+output without installing ffmpeg. The two Opus files that are not tiny — the
+128 kbps stereo CELT tone (1 s) and the 32 kbps mono Hybrid tone (2 s) — are
+still under 20 KB each, and they are what makes the Opus benchmarks and the
+Hybrid conformance test self-contained.
 
 No third-party or copyrighted content: every WAV/FLAC file is a 0.02 s, 440 Hz
 sine wave; the two MP3 files are synthetic tones described below.
@@ -90,6 +93,8 @@ ffmpeg -v error -y -f lavfi \
 | `mp3-mono-44k-128.mp3` | 1 | 132300 | mono throughput (3 s) |
 | `mp3-stereo-44k-128.mp3` | 2 | 44100 | stereo throughput: two synthesis chains (1 s) |
 | `opus-stereo-48k-128.opus` | 2 | 48000 | Opus CELT throughput: the whole CELT chain on two channels (1 s) |
+| `opus-silk-wb-12k.opus` | 1 | 96000 | Opus SILK conformance vector and throughput (2 s wideband) |
+| `opus-hybrid-mono-48k.opus` | 1 | 96000 | Opus Hybrid conformance and throughput: all 101 packets are configuration 15 (2 s) |
 
 ## What each fixture covers
 
@@ -103,8 +108,11 @@ ffmpeg -v error -y -f lavfi \
   corpus lives outside the repository (`..\zig-audio-vectors\mp3`) and the
   intensity-stereo cases are built in memory by `src/mp3_build.zig`.
 - Opus: one 440 Hz stereo tone at 128 kbps with 20 ms frames, so every packet is
-  the CELT-only configuration 31. Used by the benchmark; the conformance corpus
-  lives outside the repository (`..\zig-audio-vectors\ogg`).
+  the CELT-only configuration 31; one wideband SILK speech file (configuration
+  9), which is the SILK conformance vector; and one pure-Hybrid file whose 101
+  packets are all configuration 15, which is compared against ffmpeg in
+  `src/opus_hybrid_vectors_test.zig` and used by the benchmark. The CELT/SILK
+  conformance corpus lives outside the repository (`..\zig-audio-vectors\ogg`).
 
 ## Regenerating
 
@@ -112,7 +120,16 @@ ffmpeg -v error -y -f lavfi \
 ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=1" -ac 2 \
        -c:a libopus -b:a 128k -frame_duration 20 -application audio \
        -f ogg opus-stereo-48k-128.opus
+ffmpeg -f lavfi -i "anoisesrc=color=pink:sample_rate=48000:duration=2" -ac 1 \
+       -c:a libopus -b:a 32k -application voip -frame_duration 20 -vbr off \
+       -f ogg opus-hybrid-mono-48k.opus
 ```
+
+libopus chooses Hybrid for all 101 packets of the pink-noise file: CBR at
+32 kbps with the VOIP application selects the SWB/FB path, and pink noise has
+energy where Hybrid's high band lives. That is what makes it a *pure* Hybrid
+fixture; re-encoding with different content or a different rate can silently
+turn it into SILK or CELT, so the test pins `configs[15] == 101`.
 
 The live ffmpeg integration tests in `src/ffmpeg_test.zig` generate equivalent
 files through a pipe, where ffmpeg writes WAV `data` size `0xFFFFFFFF` and FLAC
