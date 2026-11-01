@@ -682,12 +682,52 @@ pub const Decoder = struct {
 - **调用方给缓冲**：`read()` 只在 `out` 里写，不分配；`open()` / `openBytes()` / `openFile*()` 是仅有的可能使用 allocator 的地方（WAV 的 PCM/float/G.711 不分配帧缓冲，ADPCM 分配一个压缩块和解码块；FLAC 按 STREAMINFO 的 max block size 分配一帧 i32 缓冲；两个便利入口还会分配 Reader 状态，`openFile*` 另加 64 KiB 读缓冲）。
 - **`read()` 的容量**：能解 `out.len / info.channels` 帧。`out.len` 不是声道数的整数倍时，只解完整帧，尾部 i16 不碰；`out.len == 0` 返回 0；`0 < out.len < channels` 返回 `error.ShortBuffer`。
 - **返回的是写入的 i16 个数**，一定是 `channels` 的整数倍；`0` 表示流结束。
-- **FLAC 的前缀语义**：如果某一帧失败（CRC、截断、32 位 side），此前已经解出的样本会先返回；下一次 `read()` 返回同一个错误。调用方既能拿到合法音频，也能看到具名失败，而不是被“半段静音”糊弄。
+- **前缀语义（FLAC / MP3 / Ogg Vorbis / Ogg Opus）**：如果某一帧/块/包失败（CRC、截断、32 位 side），此前已经解出的样本会先返回；下一次 `read()` 返回同一个错误。调用方既能拿到合法音频，也能看到具名失败，而不是被“半段静音”糊弄。WAV / AIFF 是**按调用全有或全无**：出错的那次调用不返回样本，前缀只来自更早的成功调用；两种规则都在下面的跨格式契约表里，并由矩阵测试逐格式断言。
 - **声道原样保留**：不做下混、不做上混、不做采样率转换。5.1 就是 6 声道。
 - **reader / 文件生命周期**：`open` 的 `reader` 由调用方持有；`openBytes` 的 `bytes` 不被复制；`openFile*` 的 `file` 不被关闭。三者都必须比 `Decoder` 活得久，`deinit()` 只释放 decoder 自己分配的东西。
-- **错误后不复用**：`read()` 返回任何错误后，这个 decoder 的状态不再保证，直接 `deinit()`；不要用“再读一次”来探测错误是否消失。
+- **错误后不复用**：`read()` 返回错误后，同一个错误会粘住（再次 `read()` 返回同一个具名错误，不会变成 0 或另一种错误），但 decoder 的状态不再保证可恢复，直接 `deinit()`；不要用“再读一次”来探测错误是否消失。
 - **入口会消费流**：`open()` 读取 12 字节签名并扫描元数据/chunk，直到首个音频帧（WAV 是 `data` 负载，FLAC 是第一帧）起点；`openFile*` 用 positional reader 从 offset 0 开始；失败时也可能已经消费了最多 12 字节（甚至更多头部）。Ogg 的 `open()` 只读到三个 Vorbis 头包就返回流式 decoder；Opus 的 `opus.open()` 只读 `OpusHead`/`OpusTags` 两个头包就返回 decoder，两者的 `total_frames` 都要读到末页 granule 才知道，所以 `read()` 到 EOF 后才填上；`opus.inspect()` 则把结构视图交出来。想先判断而不消费，用 `probe()`（需要调用方自己准备那几字节；Ogg 要 36 字节）。
 - **错误不吞**：截断、损坏、不支持、I/O 失败分别有具名错误；不使用 `catch {}` 把问题变成静音。
+
+### 跨格式契约：短缓冲、前缀与错误映射
+
+短缓冲矩阵（`src/stream_matrix_test.zig`，数据由 `src/stream_builders.zig` 在内存里构造，纯 L1）对**每一种** decoder 跑同一组调用方缓冲大小：满缓冲（对照组）、1 个 i16、3、7、13 个 i16、固定种子的随机 1..64 个 i16，以及“小缓冲/满缓冲交替”的混合序列。缓冲大小按 **i16 元素**算，不按帧算；解码器每次最多解 `out.len / channels` 帧。26 个变体（WAV PCM 8/16/24/32、float32、EXTENSIBLE PCM/float、µ-law、A-law、IMA ADPCM、MS ADPCM；AIFF 8/16/24/32；FLAC 8/12/16/24；MP3 单/立体声；Vorbis 单/立体声；Opus 单/立体声）× 7 种缓冲 = 182 个格子，断言：
+
+- 拼接起来的所有样本与满缓冲解码**逐样本相等**：不重复、不丢失、不插入静音；
+- 非帧对齐的尾部（`out[n..out.len]`，`n` 是实际写入数）**不被写**；测试先填哨兵值再检查；
+- `out.len == 0` 返回 0 且不推进状态；EOF 之后重复 `read()` 返回 0，不返回错误；
+- `0 < out.len < channels`（例如立体声 + 1 个 i16）返回 `ShortBuffer` 且**不消费任何样本**，随后换回大缓冲必须从原位置继续；
+- `read()` 期间的单次分配 ≤ 512 B（上限写在测试里；实测：WAV/AIFF/FLAC/MP3 为 **0 B**，Vorbis 的包前瞻 `ArrayList` 最大 134 B，Opus 最大 204 B），且**总分配量与调用方缓冲大小无关**（逐变体对比满缓冲基线的字节总数）。`open()` 按 STREAMINFO 分配的一帧缓冲、Ogg 的 64 KiB 页缓冲都不算在内，它们在 `read()` 之前完成。
+
+截断输入的行为（头部完整、音频负载被切掉 20 字节，切点落在最后一帧/页内部）：
+
+| 格式 | 出错的那次 `read()` | 可解前缀 | 之后再次 `read()` |
+| --- | --- | --- | --- |
+| WAV PCM / G.711 | 返回 `error.Truncated`，该次调用不返回样本 | 只来自更早的调用 | 同一个 `Truncated` |
+| WAV IMA / MS ADPCM | 返回 `error.Truncated`；同一次调用里已从上一块拷出的样本会被丢弃 | 只来自更早的调用（完整块） | 同一个 `Truncated` |
+| AIFF | 返回 `error.Truncated`，该次调用不返回样本 | 只来自更早的调用 | 同一个 `Truncated` |
+| FLAC | 先返回本次已解出的样本，错误挂起 | 是 | 同一个 `Truncated` |
+| MP3 | 同上 | 是 | 同一个 `Truncated` |
+| Ogg Vorbis | 同上 | 是 | 同一个 `Truncated` |
+| Ogg Opus | 同上 | 是 | 同一个 `Truncated` |
+
+所有行共同的断言：前缀是**未截断解码结果的精确前缀**，且严格短于它；不存在“补零到缓冲末尾”“返回 0 样本假装 EOF”或“前缀里混入静音”的行为。测试在 `src/stream_contract_test.zig`。
+
+上面这套矩阵在 `src/fixtures_test.zig` 里还有一份**真实素材**版本（L2）：MP3 单/立体声、Vorbis、FLAC 24-bit、WAV 5.1 五个仓库内 440 Hz fixture × 同一组 7 种缓冲 = 35 格。原因是 L1 合成流里 MP3 mono 与 Vorbis 的样本本身是静音（没有真实编码内容），只靠长度无法发现“等长但值被交换”的错误；真实素材把这一格补成逐样本断言。
+
+`open()` 的错误映射（每种格式 × 同一组坏输入；断言的是**错误类别**，不是“有错就行”，并且 `open` 成功 + 首个 `read` 静默返回 0 也算失败）：
+
+| 输入 | WAV | AIFF | FLAC | MP3 | Vorbis | Opus |
+| --- | --- | --- | --- | --- | --- | --- |
+| 空流 | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` |
+| 随机字节（magic 不匹配） | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` |
+| 真头、截到 12 字节 | `Truncated` | `Truncated` | `Truncated` | `Truncated` | `Truncated` | `Truncated` |
+| magic 被改坏 | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` | `NotAudio` |
+| 底层 Reader 报 `ReadFailed` | `Io` | `Io` | `Io` | `Io` | `Io` | `Io` |
+| 认识但拒绝 | `Unsupported`（RF64） | `Unsupported`（AIFC） | `open` 阶段无此类（见下） | `Unsupported`（MPEG-2） | `Unsupported`（未知 Ogg codec） | `Unsupported`（mapping family 2） |
+| 结构损坏 | `Corrupt`（`fmt` 块对齐矛盾） | `Corrupt`（COMM 过短） | `Corrupt`（STREAMINFO 块大小为 0） | `Corrupt`（bitrate index 15） | `Corrupt`（页 CRC 不符） | `Corrupt`（OpusHead version 0） |
+
+FLAC 唯一的 `Unsupported` 是**帧级**判定：32 位去相关流的 side 子帧会是 33 位，`open` 无法在不解一帧的情况下知道，所以 `open` 成功、`read` 返回 `error.Unsupported`（同一张契约测试里断言）。
 
 ### PCM 输出规则（逐比特可复现）
 
@@ -744,7 +784,7 @@ FLAC 的通式：`bits <= 16` 时左移 `16 - bits`，`bits > 16` 时算术右�
 
 ```sh
 zig build            # 编译库（static lib 到 zig-out/）
-zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz（12 种模板，323 个测试）
+zig build test       # 单元 + API + fixture + ffmpeg 集成 + 1000 轮变异 fuzz（12 种模板，329 个测试）
 zig build fuzz       # 10000 轮变异 fuzz（WAV / FLAC / MP3 / G.711 / ADPCM / AIFF / Ogg-Vorbis / Ogg-Opus 共 12 种模板）
 zig build bench      # 10 秒 WAV + 各 20 秒 FLAC（固定预测 / LPC）、MP3 与老格式解码基准（ReleaseFast；低于目标会失败）
 ```
@@ -782,6 +822,9 @@ ZA_REQUIRE_FFMPEG=1 zig build test
 - `tools/fetch-vectors.ps1`：把 13 个 [ietf-wg-cellar/flac-test-files](https://github.com/ietf-wg-cellar/flac-test-files) 官方向量下载到 `.zig-cache/vectors/`，逐个做 SHA-256 校验；向量不进 git。向量缺失时默认打印原因并 `SkipZigTest`；发布门会拒绝涉及 L4 对照的缺失。
 - `src/compare.zig`：测试辅助。把本库解出的 i16 与 ffmpeg 的 `-f s16le`、`-f s32le >> 16` 逐样本比较，并支持“截断流的可解前缀”对比（60 号向量的 50% 截断用例）。
 - `src/flac_build.zig`：测试专用的小型 FLAC 编码器，用来造 CONSTANT / VERBATIM / FIXED / LPC、各种位深、块大小扩展、wasted bits、escape code、LPC 精度/阶数/正负 shift，以及 L/S、R/S、M/S 三种去相关声道的精确用例；不参与库代码。
+- `src/stream_builders.zig`：测试专用的全格式合成流（26 个变体，全部在内存里构造）；短缓冲矩阵与错误映射契约共用，不参与库代码。
+- `src/stream_matrix_test.zig`：短缓冲矩阵（26 变体 × 6 种缓冲 = 156 格）与 `read()` 分配上限/独立性断言，纯 L1。
+- `src/stream_contract_test.zig`：截断前缀语义与 `open()` 错误映射两张契约表，纯 L1。
 - `src/legacy_vectors_test.zig`：G.711 / ADPCM / AIFF 六个 2 秒素材对 ffmpeg 的整文件逐样本验收；素材放在仓库外的 `..\zig-audio-vectors\legacy`，缺失时默认打印原因并 `SkipZigTest`，发布门下则失败。
 
 ### 目录
@@ -825,6 +868,7 @@ src/opus_silk_tables_lsf.zig      LSF 码本、权重、排序、cos 表
 src/opus_silk_tables_pitch.zig    音高/LTP/激励/立体声表
 src/opus_hybrid.zig  Hybrid 与 SILK 包：共享范围解码器、SILK→48 kHz 对齐、SILK+CELT 逐声道时域相加、冗余帧 crossfade、立体声（mid/side + 每声道重采样）
 src/ogg_build.zig / vorbis_build.zig / opus_build.zig  测试专用 Ogg 页 / Vorbis 头 / Opus 头与包的写入器（不进库）
+src/stream_builders.zig / stream_matrix_test.zig / stream_contract_test.zig  全格式合成流 + 短缓冲矩阵 + 错误/前缀契约（不进库）
 src/bench.zig       WAV + FLAC + MP3 + Ogg + 老格式基准程序
 src/fuzz.zig        变异 fuzzer（同时作为 1000 轮测试运行）
 src/compare.zig     与 ffmpeg 逐样本比较的测试辅助
