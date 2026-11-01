@@ -304,12 +304,14 @@ test "silk: samples are delivered before a Hybrid packet stops the stream" {
 
     var pcm: [4096]i16 = undefined;
     const delivered = try dec.read(&pcm);
-    // The first resampler call yields 936 rather than 960: the 16-tap
-    // interpolation filter needs its 15 samples of lookahead, and the reference
-    // decoder has exactly the same property (it carries a delayed_samples
-    // counter for it). Drop the 312-sample pre-skip and 624 are delivered.
-    try testing.expectEqual(@as(usize, 936 - 312), delivered);
+    // 969 samples come out of the first call: 936 are what the 16-tap
+    // interpolation filter can produce from one 320-sample SILK frame plus its
+    // lookahead, and 33 are the priming zeros' own contribution (11 input
+    // samples at 3x). The reference decoder splits the same stream at different
+    // points and accounts for the difference with a delayed-samples counter;
+    // only the concatenated sequence matters, and that is what the ffmpeg
+    // comparison above pins down. Drop the 312-sample pre-skip and 657 are
+    // delivered before the Hybrid packet stops the stream.
+    try testing.expectEqual(@as(usize, 969 - 312), delivered);
     try testing.expectError(opus.Error.Unsupported, dec.read(&pcm));
 }
-
-

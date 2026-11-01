@@ -1,4 +1,4 @@
-# zig-audio
+﻿# zig-audio
 
 纯 Zig 的**流式音频解码库**：不依赖 C、不依赖系统解码器、无全局状态、可 fuzz。
 
@@ -200,6 +200,8 @@ SILK 是预测编码：一个短时 LPC 滤波器 + 一个长时（音高）预�
 7. **激励**：shell 块脉冲计数（含 17 逃逸与 LSB 扩展）、PVQ 二叉树定位、raw LSB、符号、伪随机符号翻转，装配成 Q23；
 8. **合成**：系数变化处先**再白化**（把输出跑一遍新滤波器得到残差）、按增益比 `rescale`、LTP、LPC、`±1` 限幅；
 9. **重采样**：8/12/16 kHz → 48 kHz，然后交给和 CELT 完全相同的输出路径（pre-skip 裁剪 + 末页 granule 截断）。
+
+**SILK 没有去加重这一步**：去加重（ffmpeg 的 `ff_opus_deemph_weights`、α_p = 0.85）是 **CELT** 输出链的一部分；SILK 合成到 `±1` 限幅就结束了，参考实现（ffmpeg `silk.c` 与 libopus `silk/decode_core.c`）里都没有对 SILK 做去加重。这里按参考实现来——也正因为如此才有 145 dB。
 
 **为什么重采样这一步必须"复刻"而不是"写个好滤波器"**：ffmpeg 原生 Opus 解码器的 SILK 输出是 8/12/16 kHz，它用 `libswresample` 升到 48 kHz（`libavcodec/opus/dec.c` 里 `filter_size=16`、按带宽设输入率、先用几个零样本预热、每包调一次 `swr_convert`）。同一份 SILK 码流，用 libopus 自己的 `silk_resampler` 和用 swresample 差 **47 dB**——比"两个解码器"的差别大得多。所以 `src/opus_silk_resample.zig` 复刻的是 swresample 在该配置下的算术：16 抽头/相位、Kaiser 窗 β=9、cutoff 0.97、按精确有理比取相位数（48/8=6、48/12=4、48/16=3，而不是默认的 1024）、`index/frac` 定点步进、以及启动时"镜像"补历史的那段。预热零样本数按带宽取 4/8/11（NB/MB/WB）。这套东西本身用一个独立探针和 `ffmpeg -af aresample=filter_size=16` 对过：8/12/16 kHz 三个速率上都是 **~144 dB、最大差 9e-8**（就是 f32 舍入）。
 
